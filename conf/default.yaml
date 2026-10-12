@@ -1,0 +1,78 @@
+# Fox-rabies forward operator: default experiment configuration.
+# Nondimensional units throughout. See README.md for the pipeline.
+
+domain:
+  length: 10.0          # L, domain [0, L]
+  horizon: 5.0          # T, final time
+  mortality: 0.3        # mu, fixed
+  learning_cells: 256   # fixed learning grid
+  n_snapshots: 21       # equally spaced in [0, T], including t = 0
+
+solver:
+  # Solver grid = learning_cells * refinement_factor, conservatively averaged
+  # onto the learning grid. Pilot refinement (python -m fno_fox.verification)
+  # changes the learning-grid fields by far less than 0.5% at these settings.
+  refinement_factor: 2
+  dt: 0.01
+  positivity_tolerance: 1.0e-10
+  balance_tolerance: 1.0e-10
+  newton:
+    max_iterations: 25
+    residual_tolerance: 1.0e-11
+    update_tolerance: 1.0e-9
+    update_relative_tolerance: 1.0e-9
+    max_backtracks: 12
+    armijo_c: 1.0e-4
+
+sampling:
+  n_trajectories: 600
+  diffusivity: [0.02, 0.08]        # D, Latin hypercube with beta
+  transmission: [0.6, 1.2]         # beta
+  infection_amplitude: [0.01, 0.05]
+  infection_center: [4.5, 5.5]
+  infection_width: [0.2, 0.4]
+  susceptible_constant_fraction: 0.5
+  susceptible_perturbation_amplitude: [0.05, 0.2]
+  susceptible_modes: 4
+
+splits:
+  fractions: [0.7, 0.15, 0.15]     # 420 / 90 / 90 complete trajectories
+
+refinement:
+  enabled: true                    # gate production generation on pilots
+  random_pilots: 4                 # in addition to four corner pilots
+  threshold: 0.005                 # channel-wise normalized RMS change
+
+pairs:
+  later_source_per_trajectory: 20  # plus all 20 initial-source pairs
+
+model:
+  modes: 16
+  width: 32
+  n_layers: 4
+  cond_hidden: 64
+  dropout: 0.0
+
+training:
+  epochs: 200
+  batch_size: 64
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_workers: 0
+  device: auto                     # CUDA when available, else CPU
+
+evaluation:
+  batch_size: 256
+  front_threshold: 0.01
+  speed_window: [2.5, 5.0]
+  min_front_points: 4
+  interpolation_trajectories: 10
+  interpolation_source_times: [0.0, 2.5]
+  representative_trajectories: 3
+
+seeds:
+  sampling: 1
+  split: 2
+  pairs: 3
+  training: 4
+  refinement: 5
