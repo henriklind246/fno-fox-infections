@@ -304,6 +304,103 @@ inverse manifest. Only IDs listed in the current manifest belong to that run;
 older, unselected case directories may remain. Numerical case failures are
 recorded and processing continues, with a nonzero CLI exit status if any fail.
 
+### 6. Paired spatial-sensor inverse sweep
+
+```bash
+python -m fno_fox.inverse_sensor_sweep --config conf/default.yaml --data data/fox_rabies --checkpoint runs/default/best.pt --output runs/default/sensor_sweep
+```
+
+This entry point runs the same unique test trajectories through five noiseless
+observation configurations. Both complete initial fields remain known; only
+the later-time observations used for fitting are selected at sensors.
+
+| Configuration | Spatial sensors | Positive observation times | Channels |
+|---|---:|---:|---|
+| Baseline | all 256 learning cells | 20 | S, I |
+| Sparse A | 32 | 20 | S, I |
+| Sparse B | 16 | 20 | S, I |
+| Sparse C | 8 | 20 | S, I |
+| Sparse D | 4 | 20 | S, I |
+
+The sweep requires **100 unique test trajectories** by default
+(`inverse.sweep_cases: 100`). It selects them reproducibly, aiming for 50 cases
+from each initial susceptible-field family and filling from remaining test
+cases if a family is too small. Every configuration uses the same selected IDs.
+The existing 600-trajectory dataset has **only 90 test cases**, so the default
+command above fails before model loading or inference. Supply a matching
+dataset/checkpoint with at least 100 test cases to run the default protocol.
+The sweep never repeats trajectories or borrows training/validation cases.
+The standalone inverse command retains `inverse.pilot_cases: 10`.
+
+`--sim-ids` must provide exactly `inverse.sweep_cases` distinct test IDs.
+`--all-test` runs the complete test split, provided it meets that minimum.
+`--device` and `--overwrite` follow the standalone command's conventions;
+overwrite requires an existing sensor-sweep manifest. Reducing `sweep_cases`
+in a configuration explicitly changes the protocol and is useful for small
+test fixtures. The baseline uses all cells on smaller grids; at least 32
+learning cells are required. All saved positive times are used, so smaller
+fixtures also have fewer observation times.
+
+Sensors are learning-grid cell indices
+`rint(linspace(0, Nx-1, n_sensors))`, approximately equally spaced from the
+first through last cell centre. Their coordinates, channels, and times are
+fixed across trajectories. No interpolation or noise is added. The layouts
+are independently uniform for each count; they are not nested subsets.
+The FNO still predicts on the complete grid. Fitting losses and observation
+Jacobians use only the selected cells, with the existing global channel
+normalization. Each selected Jacobian uses
+`m = 2 * sensor_count * positive_time_count` for its `1/sqrt(m)` scaling;
+`observed_scalars` is saved explicitly. These are average dimensionless
+sensitivities, not confidence or information estimates.
+
+Each configuration retains the 25×25 loss grid, four/eight-start comparison,
+optimizer budgets, corner checks, boundary searches, and sensitivity
+diagnostics at truth, the grid minimum, and both recovered estimates. The
+seven random starts are identical across configurations for each trajectory;
+the first start is each configuration's own grid minimum. Parameter bounds,
+normalization, channels, times, model, and case IDs stay fixed.
+
+Grid predictions are computed once per trajectory and reduced to five
+sensor-specific losses. Validation predictions are also computed once and
+selected for each layout. Identical diagnostic parameter pairs reuse full
+predictions, Jacobians, and FV replays within a trajectory. No FV parameter
+optimization, probabilistic error model, or uncertainty intervals are used.
+Repeated optimizer queries use a per-trajectory cache capped at 64 full
+predictions. Actual forward queries and cache hits are recorded separately
+from optimizer objective-evaluation counts.
+
+Reports retain parameter signed/absolute/relative errors and RMSE, plus
+physical S/I bias, RMSE, and relative L2 overall and by time. FNO-versus-data,
+FV-versus-data, and FNO-versus-FV metrics each have explicit **sensor** and
+**full_grid** scopes. Full-grid reference fields are used for evaluation
+after fitting; unobserved later-time cells do not enter the fitting loss.
+Across-case summaries use median, Q1, Q3, and IQR. Paired changes are sparse
+minus baseline, matching both simulation ID and four/eight-start count.
+Successful and failed counts and the paired sample sizes are reported.
+
+The output contains:
+
+- `manifest.json`: the selected IDs and layouts written before inference,
+  provenance, times/channels, normalization, bounds, and completion status.
+- `cases.csv`, `summary.json`, `paired_changes.csv`: configuration/start-count
+  results, aggregates, and paired changes relative to baseline.
+- `shared_costs.json`: shared grid, validation, diagnostic prediction,
+  Jacobian, and FV computation. Configuration optimizer totals exclude the
+  shared grids; four/eight-start totals must not be added together.
+- `validation_residuals.npz/.json`: shared descriptive full-grid residuals.
+- `configurations/<name>/`: selected validation residuals, configuration
+  summaries and figures, and `cases/<sim_id>/` numerical artifacts and plots.
+- `sensor_recovery.png`, `sensor_replay_errors.png`,
+  `sensor_sensitivities.png`, `sensor_start_stability.png`: comparisons versus
+  sensor count. The first three use eight-start results; error bars show the
+  interquartile spread across successful trajectories, not confidence bounds.
+
+Numerical failures are retained per configuration and trajectory, processing
+continues, and any failure gives a nonzero CLI exit status. Paired summaries
+only use matching successful cases and explicitly count exclusions. On
+overwrite, only IDs listed in the current manifest belong to the new run;
+older unselected case directories may remain.
+
 ## Tests
 
 ```bash
@@ -328,6 +425,10 @@ The suite covers:
   basins), hard evaluation budgets, nested-start reuse, FFT Jacobians versus
   finite differences, rank-deficient sensitivities, physical metrics, FV
   replay, and a tiny trained-checkpoint end-to-end test with saved figures.
+- **Spatial-sensor sweep:** strict unique-case selection, uniform layouts,
+  full-grid baseline equivalence, isolation from unobserved target cells,
+  masked Jacobians, shared computation, paired metrics/failures, and a tiny
+  all-five-configuration end-to-end fixture.
 
 The pilot refinement test is marked `slow`; deselect it with `-m "not slow"`.
 

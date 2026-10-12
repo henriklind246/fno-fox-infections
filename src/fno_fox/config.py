@@ -206,6 +206,7 @@ class EvaluationConfig:
 @dataclass(frozen=True)
 class InverseConfig:
     pilot_cases: int = 10
+    sweep_cases: int = 100
     selection_seed: int = 0
     start_seed: int = 0
     grid_size: int = 25
@@ -224,7 +225,7 @@ class InverseConfig:
 
         if self.grid_size < 3:
             raise ValueError("inverse.grid_size must be at least 3.")
-        if min(self.pilot_cases, self.batch_size, self.max_iterations,
+        if min(self.pilot_cases, self.sweep_cases, self.batch_size, self.max_iterations,
                self.max_evaluations, self.edge_max_evaluations) < 1:
             raise ValueError("inverse counts and optimization budgets must be positive.")
         if min(self.selection_seed, self.start_seed) < 0:

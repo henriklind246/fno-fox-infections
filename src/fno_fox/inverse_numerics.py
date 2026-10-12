@@ -43,16 +43,28 @@ class FieldObjective:
     """Truth-free inverse interface; parameter truth is never stored here."""
 
     def __init__(self, model, encoder: FieldEncoder, obs: FullFieldObservations,
-                 device: torch.device, batch_size: int):
+                 device: torch.device, batch_size: int, sensor_indices=None,
+                 prediction_cache=None, prediction_stats=None):
         self.model = model.eval()
         self.model.requires_grad_(False)
         self.encoder, self.obs = encoder, obs
         self.device, self.batch_size = device, batch_size
+        self.prediction_cache, self.prediction_stats = prediction_cache, prediction_stats
         self.bounds = np.asarray((encoder.diffusivity_range, encoder.transmission_range), dtype=np.float64)
         self.low = self.bounds[:, 0]
         self.ranges = np.diff(self.bounds, axis=1).ravel()
         self.source = torch.as_tensor(obs.source, device=device)
         self.times = torch.as_tensor(obs.times / encoder.horizon, dtype=torch.float32, device=device)
+        nx = obs.targets.shape[1]
+        indices = np.arange(nx) if sensor_indices is None else np.asarray(sensor_indices)
+        if (indices.ndim != 1 or not len(indices) or indices.dtype.kind not in "iu"
+                or np.any(indices < 0) or np.any(indices >= nx)
+                or len(np.unique(indices)) != len(indices)):
+            raise ValueError("Sensor indices must be distinct integer learning-grid cell indices.")
+        self.sensor_indices = indices.astype(np.int64)
+
+    def observe(self, fields: np.ndarray) -> np.ndarray:
+        return np.take(fields, self.sensor_indices, axis=-2)
 
     def physical_parameters(self, z: np.ndarray) -> np.ndarray:
         return self.low + np.asarray(z) * self.ranges
@@ -67,6 +79,12 @@ class FieldObjective:
     @torch.no_grad()
     def predict_many(self, points: np.ndarray) -> np.ndarray:
         points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        key = tuple(points[0]) if self.prediction_cache is not None and len(points) == 1 else None
+        if key is not None and key in self.prediction_cache:
+            self.prediction_cache.move_to_end(key)
+            if self.prediction_stats is not None:
+                self.prediction_stats["cache_hits"] += 1
+            return self.prediction_cache[key].copy()
         nt = len(self.times)
         # Batch field queries, not parameter pairs, so memory stays bounded as Nt grows.
         result = np.empty((len(points) * nt, *self.obs.targets.shape[1:]), dtype=np.float32)
@@ -76,11 +94,21 @@ class FieldObjective:
             time = self.times[torch.as_tensor(idx % nt, device=self.device)]
             cond = torch.cat((z, time[:, None]), dim=1)
             prediction = self.model(self.source.expand(len(idx), -1, -1), cond)
+            if self.prediction_stats is not None:
+                self.prediction_stats["field_queries"] += len(idx)
             values = prediction.cpu().numpy()
             if not np.isfinite(values).all():
                 raise ValueError("Non-finite FNO prediction during inverse evaluation.")
             result[first:first + len(idx)] = values
-        return result.reshape(len(points), *self.obs.targets.shape)
+        result = result.reshape(len(points), *self.obs.targets.shape)
+        if self.prediction_stats is not None:
+            self.prediction_stats["parameter_predictions"] += len(points)
+        if key is not None:
+            self.prediction_cache[key] = result.copy()
+            # A per-trajectory LRU bounds storage during thousands of optimizer queries.
+            if len(self.prediction_cache) > 64:
+                self.prediction_cache.popitem(last=False)
+        return result
 
     def losses(self, points: np.ndarray) -> np.ndarray:
         # Keep the full 625 x Nt x Nx x 2 grid out of memory on larger datasets.
@@ -88,7 +116,8 @@ class FieldObjective:
         result = []
         for first in range(0, len(points), count):
             values = self.predict_many(points[first:first + count]).astype(np.float64)
-            result.extend(0.5 * np.mean((values - self.obs.targets) ** 2, axis=(1, 2, 3)))
+            residual = self.observe(values) - self.observe(self.obs.targets)
+            result.extend(0.5 * np.mean(residual ** 2, axis=(1, 2, 3)))
         return np.asarray(result)
 
     def __call__(self, z: np.ndarray) -> float:
@@ -99,6 +128,10 @@ class FieldObjective:
         return np.stack(self.encoder.decode(pred), axis=-1)
 
     def jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        physical, scaled = self.full_jacobians(z)
+        return select_jacobians(physical, scaled, self.sensor_indices)
+
+    def full_jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Physical J[..., output_channel, parameter] and dimensionless flattened Js."""
         point = torch.tensor(z, dtype=torch.float32, device=self.device)
         chunks = []
@@ -120,6 +153,13 @@ class FieldObjective:
         return physical, scaled
 
 
+def select_jacobians(physical: np.ndarray, scaled: np.ndarray, indices: np.ndarray):
+    selected = np.take(physical, indices, axis=1)
+    selected_scaled = np.take(scaled.reshape(physical.shape), indices, axis=1).reshape(-1, 2)
+    selected_scaled *= np.sqrt(len(scaled) / len(selected_scaled))
+    return selected, selected_scaled
+
+
 def sensitivity_summary(jacobian: np.ndarray) -> dict:
     matrix = np.asarray(jacobian, dtype=np.float64).reshape(-1, 2)
     norms = np.linalg.norm(matrix, axis=0)
@@ -131,6 +171,7 @@ def sensitivity_summary(jacobian: np.ndarray) -> dict:
     if weak[np.argmax(np.abs(weak))] < 0:
         weak *= -1
     return {
+        "observed_scalars": len(matrix),
         "column_norms": norms.tolist(),
         "column_cosine": float(np.clip(matrix[:, 0] @ matrix[:, 1] / np.prod(norms), -1, 1))
         if np.all(norms > 0) else None,
@@ -154,6 +195,33 @@ def joint_grid(losses: Callable, size: int) -> dict:
         raise ValueError("Non-finite joint-grid loss.")
     return {"axis": axis, "loss": loss, "best_z": points[np.argmin(loss)],
             "evaluations": len(points), "wall_seconds": perf_counter() - start}
+
+
+def shared_joint_grids(objective: FieldObjective, layouts: dict, size: int) -> tuple[dict, dict]:
+    """One full-grid forward per parameter pair, reduced for every sensor layout."""
+    axis = np.linspace(0, 1, size)
+    d, beta = np.meshgrid(axis, axis, indexing="ij")
+    points = np.stack((d.ravel(), beta.ravel()), axis=-1)
+    losses = {name: np.empty(len(points)) for name in layouts}
+    batch = max(1, objective.batch_size // len(objective.times))
+    begin = perf_counter()
+    for first in range(0, len(points), batch):
+        values = objective.predict_many(points[first:first + batch]).astype(np.float64)
+        residual = values - objective.obs.targets
+        for name, indices in layouts.items():
+            selected = np.take(residual, indices, axis=2)
+            losses[name][first:first + len(values)] = .5 * np.mean(selected ** 2, axis=(1, 2, 3))
+    grids = {}
+    for name, values in losses.items():
+        if not np.isfinite(values).all():
+            raise ValueError(f"Non-finite joint-grid loss for {name}.")
+        grids[name] = {"axis": axis, "loss": values.reshape(size, size),
+                       "best_z": points[np.argmin(values)], "evaluations": 0,
+                       "wall_seconds": 0., "shared_grid": True,
+                       "logical_grid_evaluations": len(points)}
+    cost = {"parameter_predictions": len(points), "field_queries": len(points) * len(objective.times),
+            "wall_seconds": perf_counter() - begin}
+    return grids, cost
 
 
 def recover(objective: Callable, grid: dict, config: InverseConfig, seed: int) -> dict:

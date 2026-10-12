@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections import OrderedDict
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -19,7 +20,9 @@ import torch
 from fno_fox.config import FoxConfig, config_from_dict, load_config
 from fno_fox.data import DatasetBundle, FieldEncoder, capture_git_state, file_sha256, load_dataset
 from fno_fox.evaluate import trajectory_parameters
-from fno_fox.inverse_numerics import FieldObjective, joint_grid, observations, recover, sensitivity_summary
+from fno_fox.inverse_numerics import (
+    FieldObjective, joint_grid, observations, recover, select_jacobians, sensitivity_summary,
+)
 from fno_fox.physics import acceptance_report, simulate
 from fno_fox.train import check_dataset_compatibility, load_checkpoint, resolve_device
 
@@ -177,7 +180,8 @@ def fv_replay(bundle, sim, theta):
     return np.stack((s[1:], i[1:]), axis=-1)
 
 
-def evaluate_case(bundle, sim, model, encoder, device, config, directory):
+def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
+                  sensor_indices=None, grid=None, shared=None, configuration=None):
     directory.mkdir(parents=True, exist_ok=True)
     for name in ("failure.json", "result.json", "metrics.json", "sensitivities.json",
                  "grid.npz", "optimizer.json", "optimizer_trace.csv", "fields.npz", "jacobians.npz",
@@ -185,8 +189,20 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory):
         (directory / name).unlink(missing_ok=True)
     begin = perf_counter()
     obs = observations(bundle, encoder, sim)
-    objective = FieldObjective(model, encoder, obs, device, config.batch_size)
-    grid = joint_grid(objective.losses, config.grid_size)
+    cache_enabled = shared is not None
+    shared = {} if shared is None else shared
+    prediction_cache = shared.setdefault("objective_predictions", OrderedDict()) if cache_enabled else None
+    prediction_stats = shared.setdefault("forward_queries", {"parameter_predictions": 0, "field_queries": 0,
+                                                            "cache_hits": 0}) if cache_enabled else None
+    objective = FieldObjective(model, encoder, obs, device, config.batch_size, sensor_indices,
+                               prediction_cache, prediction_stats)
+    if grid is None:
+        grid = joint_grid(objective.losses, config.grid_size)
+    full_jacobians = shared.setdefault("jacobians", {})
+    full_predictions = shared.setdefault("predictions", {})
+    fv_predictions = shared.setdefault("fv", {})
+    shared_cost = shared.setdefault("cost", {"jacobian_wall_seconds": 0., "prediction_wall_seconds": 0.,
+                                            "fv_wall_seconds": 0.})
     np.savez_compressed(directory / "grid.npz", unit_axis=grid["axis"],
                         D_axis=objective.low[0] + grid["axis"] * objective.ranges[0],
                         beta_axis=objective.low[1] + grid["axis"] * objective.ranges[1],
@@ -197,7 +213,11 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory):
     def sensitivity(label, point):
         key = tuple(np.asarray(point, dtype=float))
         if key not in cache:
-            physical, scaled = objective.jacobians(point)
+            if key not in full_jacobians:
+                start = perf_counter()
+                full_jacobians[key] = objective.full_jacobians(point)
+                shared_cost["jacobian_wall_seconds"] += perf_counter() - start
+            physical, scaled = select_jacobians(*full_jacobians[key], objective.sensor_indices)
             cache[key] = physical, scaled, sensitivity_summary(scaled)
         physical, scaled, report = cache[key]
         sensitivities[label] = {"theta": objective.physical_parameters(point), **report}
@@ -216,14 +236,26 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory):
         sensitivity(f"starts_{arm}", z)
         key = tuple(np.asarray(z, dtype=float))
         if key not in replay_cache:
-            replay_cache[key] = objective.physical_prediction(z), fv_replay(bundle, sim, theta)
+            if key not in full_predictions:
+                start = perf_counter()
+                full_predictions[key] = objective.physical_prediction(z)
+                shared_cost["prediction_wall_seconds"] += perf_counter() - start
+            if key not in fv_predictions:
+                start = perf_counter()
+                fv_predictions[key] = fv_replay(bundle, sim, theta)
+                shared_cost["fv_wall_seconds"] += perf_counter() - start
+            replay_cache[key] = full_predictions[key], fv_predictions[key]
         fno, fv = replay_cache[key]
         predictions[f"fno_{arm}"] = fno
         predictions[f"fv_{arm}"] = fv
-        metrics[arm] = {
-            "fno_vs_observation": field_metrics(fno, obs.physical_targets, obs.times),
-            "fv_vs_observation": field_metrics(fv, obs.physical_targets, obs.times),
-            "fno_vs_fv": field_metrics(fno, fv, obs.times),
+        comparisons = {"fno_vs_observation": (fno, obs.physical_targets),
+                       "fv_vs_observation": (fv, obs.physical_targets), "fno_vs_fv": (fno, fv)}
+        full_metrics = {name: field_metrics(pred, truth, obs.times)
+                        for name, (pred, truth) in comparisons.items()}
+        metrics[arm] = full_metrics if sensor_indices is None else {
+            "full_grid": full_metrics,
+            "sensor": {name: field_metrics(objective.observe(pred), objective.observe(truth), obs.times)
+                       for name, (pred, truth) in comparisons.items()},
         }
         row = {"sim_id": sim, "starts": int(arm),
                "susceptible_constant": bool(bundle.parameters["susceptible_constant"][sim]),
@@ -231,31 +263,41 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory):
                                           "wall_seconds", "nonconverged_starts", "nonconverged_edges")},
                "parameter_change_flag": result["parameter_change_flag"],
                "loss_change_flag": result["loss_change_flag"], "loss_improvement": result["loss_improvement"]}
+        if configuration is not None:
+            row.update(configuration=configuration, sensor_count=len(objective.sensor_indices),
+                       observed_scalars=obs.targets.shape[0] * len(objective.sensor_indices) * 2)
         for k, name in enumerate(PARAMETERS):
             error = float(theta[k] - theta_true[k])
             row.update({f"{name}_true": float(theta_true[k]), f"{name}_hat": float(theta[k]),
                         f"{name}_error": error, f"{name}_abs_error": abs(error),
                         f"{name}_relative_error_pct": 100 * abs(error / theta_true[k]) if theta_true[k] != 0 else None,
                         f"{name}_start_change_fraction": float(result["parameter_change_fraction"][k])})
-        for comparison, channels in metrics[arm].items():
-            for channel, values in channels.items():
-                for metric in ("rmse", "relative_l2", "bias"):
-                    row[f"{comparison}_{channel}_{metric}"] = values[metric]
+        scopes = {"": metrics[arm]} if sensor_indices is None else metrics[arm]
+        for scope, comparisons_ in scopes.items():
+            for comparison, channels in comparisons_.items():
+                for channel, values in channels.items():
+                    for metric in ("rmse", "relative_l2", "bias"):
+                        prefix = f"{comparison}_{scope}" if scope else comparison
+                        row[f"{prefix}_{channel}_{metric}"] = values[metric]
         report = sensitivities[f"starts_{arm}"]
         for k, name in enumerate(PARAMETERS):
             row[f"sensitivity_{name}"] = report["column_norms"][k]
             row[f"singular_value_{k}"] = report["singular_values"][k]
         row.update({k: report[k] for k in ("condition_number", "column_cosine", "numerical_rank")})
         rows.append(row)
-    np.savez_compressed(directory / "jacobians.npz", times=obs.times, x_centers=bundle.x_centers,
+    np.savez_compressed(directory / "jacobians.npz", times=obs.times,
+                        x_centers=bundle.x_centers[objective.sensor_indices], sensor_indices=objective.sensor_indices,
                         parameter_names=np.array(PARAMETERS), channel_names=np.array(CHANNELS), **sensitivity_arrays)
     np.savez_compressed(directory / "fields.npz", times=obs.times, x_centers=bundle.x_centers,
+                        sensor_indices=objective.sensor_indices,
                         observed=obs.physical_targets,
                         initial=np.stack((bundle.susceptible[sim, 0], bundle.infectious[sim, 0]), axis=-1), **predictions)
     write_json(directory / "metrics.json", metrics)
     write_json(directory / "sensitivities.json", sensitivities)
     report = {"sim_id": sim, "theta_true": theta_true, "rows": rows,
               "grid_evaluations": grid["evaluations"], "grid_wall_seconds": grid["wall_seconds"],
+              "shared_grid": grid.get("shared_grid", False),
+              "logical_grid_evaluations": grid.get("logical_grid_evaluations", grid["evaluations"]),
               "unique_jacobian_points": len(cache), "unique_fv_replays": len(replay_cache),
               "wall_seconds": perf_counter() - begin}
     write_json(directory / "result.json", report)

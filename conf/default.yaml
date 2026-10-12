@@ -79,6 +79,7 @@ seeds:
 
 inverse:
   pilot_cases: 10
+  sweep_cases: 100                # paired spatial-sensor sweep; requires >=100 test cases
   selection_seed: 0
   start_seed: 0
   grid_size: 25

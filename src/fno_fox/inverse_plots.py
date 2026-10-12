@@ -110,7 +110,85 @@ def plot_inverse(root: Path, rows: list[dict]) -> None:
                 for col, idx in enumerate(indices):
                     for field, label, style in (("observed", "Observed", "-"), ("fno_8", "FNO", "--"), ("fv_8", "FV replay", ":")):
                         axes[channel, col].plot(data["x_centers"], data[field][idx, :, channel], style, label=label)
+                    sensors = data["sensor_indices"] if "sensor_indices" in data else np.arange(len(data["x_centers"]))
+                    if len(sensors) < len(data["x_centers"]):
+                        axes[channel, col].plot(data["x_centers"][sensors], data["observed"][idx, sensors, channel],
+                                               "ko", markerfacecolor="none", markersize=4, label="Fitted sensors")
                     axes[channel, col].set(xlabel="x", ylabel=f"{name} density", title=f"t = {data['times'][idx]:g}")
                     axes[channel, col].legend()
             fig.suptitle(f"Case {eight['sim_id']}: eight-start estimate")
             _save(fig, directory / "reconstruction.png")
+
+
+def plot_sensor_sweep(root: Path, report: dict, layouts: dict) -> None:
+    ordered = sorted(layouts, key=lambda key: layouts[key]["sensor_count"])
+    counts = [layouts[key]["sensor_count"] for key in ordered]
+
+    def curve(ax, distributions, label):
+        def values(key):
+            return np.array([np.nan if d[key] is None else d[key] for d in distributions])
+        median, low, high = values("median"), values("q1"), values("q3")
+        ax.errorbar(counts, median, yerr=np.stack((median - low, high - median)),
+                    marker="o", capsize=3, label=label)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(sorted(set(counts)), sorted(set(counts)))
+        ax.set_xlabel("Spatial sensors")
+        ax.grid(alpha=.2)
+
+    def arm(key, n=8):
+        return report["configurations"][key]["arms"][str(n)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for ax, name in zip(axes, ("D", "beta")):
+        curve(ax, [arm(key)["parameters"][name]["abs_error"] for key in ordered], name)
+        ax.set(title=f"{name} recovery", ylabel="Absolute parameter error")
+        ax.set_ylim(bottom=0)
+    fig.suptitle("Eight starts: median and interquartile range across successful cases")
+    _save(fig, root / "sensor_recovery.png")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), squeeze=False)
+    for row, scope in enumerate(("sensor", "full_grid")):
+        for col, channel in enumerate(("S", "I")):
+            ax = axes[row, col]
+            for comparison in ("fno_vs_observation", "fv_vs_observation", "fno_vs_fv"):
+                metric = f"{comparison}_{scope}_{channel}_rmse"
+                curve(ax, [arm(key)["fields"].get(metric, {"median": None, "q1": None, "q3": None}) for key in ordered],
+                      comparison.replace("_", " "))
+            ax.set(title=f"{channel}: {scope.replace('_', ' ')}", ylabel="Physical density RMSE")
+            ax.set_ylim(bottom=0)
+            ax.legend()
+    fig.suptitle("Eight starts: median and interquartile range across successful cases")
+    _save(fig, root / "sensor_replay_errors.png")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for ax, metric, title in zip(axes, ("singular_value_1", "condition_number", "column_cosine"),
+                               ("Smallest scaled singular value", "Condition number", "Signed column cosine")):
+        curve(ax, [arm(key)["sensitivities"][metric] for key in ordered], title)
+        ax.set_title(title)
+        if metric == "column_cosine":
+            ax.set_ylim(-1.05, 1.05)
+        else:
+            ax.set_ylim(bottom=0)
+            ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    fig.suptitle("Local FNO diagnostics at eight-start estimates; undefined quantities omitted")
+    _save(fig, root / "sensor_sensitivities.png")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for name in ("D", "beta"):
+        curve(axes[0], [report["configurations"][key]["start_comparison"][f"{name}_change_fraction"]
+                        for key in ordered], name)
+    axes[0].set(title="Four → eight starts", ylabel="Parameter change / admissible range")
+    axes[0].legend()
+    curve(axes[1], [report["configurations"][key]["start_comparison"]["loss_improvement"] for key in ordered], "Loss")
+    axes[1].set(title="Additional-start improvement", ylabel="Loss (4 starts) − loss (8 starts)")
+    for n in (4, 8):
+        total = [arm(key, n)["objective_evaluations"] for key in ordered]
+        axes[2].plot(counts, total, "o-", label=f"{n} starts")
+    axes[2].set_xscale("log", base=2)
+    axes[2].set_xticks(sorted(set(counts)), sorted(set(counts)))
+    axes[2].set(title="Configuration optimization cost", ylabel="Total objective evaluations", xlabel="Spatial sensors")
+    axes[2].legend()
+    for ax in axes:
+        ax.set_ylim(bottom=0)
+    fig.suptitle("Shared grids excluded; per-configuration costs include boundary searches")
+    _save(fig, root / "sensor_start_stability.png")

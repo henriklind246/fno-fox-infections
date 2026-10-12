@@ -93,3 +93,15 @@ measurement noise, surrogate variance calibration, effective-correlation
 factors, likelihoods, chi-squared thresholds, profile confidence intervals,
 and FV polishing are not imported. Validation residuals are descriptive
 signed error fields, and grid minima are deterministic coarse summaries.
+
+## Paired spatial-sensor sweep
+
+`src/fno_fox/inverse_sensor_sweep.py` extends the project-local inverse workflow
+with the paired full-grid/32/16/8/4-cell protocol. It reuses the current loaders,
+optimizer, sensitivity summaries, FV replay, and plotting routines. No
+additional source files from `no-tps-ihcp` were copied. Observation selection
+uses existing cell values consistently for both channels and all positive
+times. Grid/validation predictions and identical diagnostic parameter pairs
+are shared across configurations. Sensor and complete-grid metrics are
+reported separately, with paired changes relative to the complete-grid
+baseline. The default sweep requires 100 unique held-out test trajectories.
