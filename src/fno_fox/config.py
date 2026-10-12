@@ -204,6 +204,40 @@ class EvaluationConfig:
 
 
 @dataclass(frozen=True)
+class InverseConfig:
+    pilot_cases: int = 10
+    selection_seed: int = 0
+    start_seed: int = 0
+    grid_size: int = 25
+    batch_size: int = 64
+    max_iterations: int = 100
+    max_evaluations: int = 250
+    edge_max_evaluations: int = 50
+    coordinate_tolerance: float = 1.0e-5
+    objective_tolerance: float = 1.0e-10
+    parameter_change_tolerance: float = 0.005
+    loss_change_absolute: float = 1.0e-10
+    loss_change_relative: float = 0.01
+
+    def validate(self) -> None:
+        import math
+
+        if self.grid_size < 3:
+            raise ValueError("inverse.grid_size must be at least 3.")
+        if min(self.pilot_cases, self.batch_size, self.max_iterations,
+               self.max_evaluations, self.edge_max_evaluations) < 1:
+            raise ValueError("inverse counts and optimization budgets must be positive.")
+        if min(self.selection_seed, self.start_seed) < 0:
+            raise ValueError("inverse seeds must be nonnegative.")
+        for name in ("coordinate_tolerance", "objective_tolerance",
+                     "parameter_change_tolerance", "loss_change_absolute",
+                     "loss_change_relative"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"inverse.{name} must be finite and positive.")
+
+
+@dataclass(frozen=True)
 class SeedConfig:
     sampling: int = 1
     split: int = 2
@@ -223,6 +257,7 @@ class FoxConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    inverse: InverseConfig = field(default_factory=InverseConfig)
     seeds: SeedConfig = field(default_factory=SeedConfig)
 
     def validate(self) -> None:
@@ -235,6 +270,7 @@ class FoxConfig:
         self.model.validate()
         self.training.validate()
         self.evaluation.validate()
+        self.inverse.validate()
 
     @property
     def solver_cells(self) -> int:

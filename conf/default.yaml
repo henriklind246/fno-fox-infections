@@ -76,3 +76,18 @@ seeds:
   pairs: 3
   training: 4
   refinement: 5
+
+inverse:
+  pilot_cases: 10
+  selection_seed: 0
+  start_seed: 0
+  grid_size: 25
+  batch_size: 64                  # maximum field queries per forward batch
+  max_iterations: 100
+  max_evaluations: 250            # per Nelder–Mead start
+  edge_max_evaluations: 50        # per boundary edge
+  coordinate_tolerance: 1.0e-5
+  objective_tolerance: 1.0e-10
+  parameter_change_tolerance: 0.005  # fraction of each admissible range
+  loss_change_absolute: 1.0e-10
+  loss_change_relative: 0.01

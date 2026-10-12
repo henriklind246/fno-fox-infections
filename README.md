@@ -1,10 +1,10 @@
 # fno-fox-infections
 Repository for forward and inverse modeling of fox infections
 
-This repository currently implements the **forward** part: a time-conditioned
+This repository implements a **forward** time-conditioned
 1D Fourier neural operator (FNO) trained on admissible source–target pairs
-from a verified finite-volume reference solver. Inverse inference is not
-implemented yet.
+from a verified finite-volume reference solver, and a **noiseless full-field
+inverse** pipeline for recovering diffusivity and transmission rate.
 
 ## Model and operator
 
@@ -220,6 +220,90 @@ check use that requested split. Interpolation source times must match saved
 snapshots strictly before the final snapshot; invalid settings fail before
 model inference or interpolation reference solves.
 
+### 5. Identifiability-first inverse experiment
+
+After training, run:
+
+```bash
+python -m fno_fox.inverse --config conf/default.yaml --data data/fox_rabies --checkpoint runs/default/best.pt --output runs/default/inverse
+```
+
+The default pilot selects ten test trajectories reproducibly (selection seed
+0), five with constant initial susceptible fields and five with cosine fields
+when available. Smaller test splits use all available cases. Selection never
+uses recovery results. To choose cases explicitly, append `--sim-ids 1 17 42`
+(each ID must be in the test split); use `--all-test` for the complete split.
+`--device cpu` or `--device cuda` overrides automatic device selection.
+
+The observations are both **complete S and I fields at every saved positive
+time**, with the noiseless initial fields supplied as known inputs. The FNO is
+frozen and each time is queried directly from t=0. Only `(D, beta)` is fitted;
+mortality and initial-profile parameters remain fixed. The objective is half
+the mean squared residual after the checkpoint's per-channel normalization,
+with equal weights for all channels, times, and cells. Bounds come from the
+checkpoint's conditioning ranges. No measurement noise is generated.
+
+The inverse run first computes a 25×25 loss grid over the closed parameter box,
+then computes local sensitivities at its minimum and at the known parameters.
+It refines recovery with eight reproducible starts, including the grid minimum,
+and reports the best result from the first four alongside the best from all
+eight. The first four are reused, not rerun. Each start has at most 100
+Nelder–Mead iterations and 250 objective evaluations. Four additional scalar
+edge searches (at most 50 evaluations each) and explicit corners address
+boundary solutions. Both comparisons share those candidates. Their reported
+costs each include the grid and edges, so **do not add the arm totals**.
+Budget exhaustion is recorded as nonconvergence, not successful optimization.
+The best finite candidate is retained even if convergence was not established.
+
+Sensitivities use two Jacobian–vector products through the FNO. Artifacts retain
+physical derivatives with respect to D and beta, plus a dimensionless Jacobian:
+outputs divided by checkpoint channel standard deviations, parameter columns
+multiplied by their admissible ranges, and all entries divided by sqrt(number
+of observed scalars). Diagnostics report column norms, signed column cosine,
+singular values, condition number, and the weakest parameter direction.
+Rank-deficient condition numbers and undefined zero-column cosines are JSON
+`null`, with explicit rank/zero-column flags. These are **local FNO diagnostics**;
+they do not establish structural identifiability of the PDE. Small column
+norms and nearly parallel columns describe different sources of instability.
+
+Validation residuals at true parameters retain signed bias and spatial/time
+structure. Validation also selected the checkpoint during training, so these
+are descriptive discrepancies, not independent uncertainty calibration.
+There is no correlation multiplier, Gaussian likelihood, chi-squared threshold,
+confidence interval, or bias correction. One-dimensional curves extracted
+from the grid are labeled **coarse grid minima**.
+
+Every recovered estimate is replayed with the finite-volume solver using the
+known initial-profile specification. Identical four/eight-start estimates
+reuse the replay and sensitivity calculation. No FV parameter optimization
+is performed. Reported metrics include parameter signed/absolute/relative
+errors and RMSE; S/I reconstruction, FV-versus-observation and FNO-versus-FV
+RMSE and relative L2, overall and by time. Across-case distributions use median,
+Q1, Q3, and IQR. Additional-start changes are flagged above 0.5% of either
+parameter range, or a loss improvement above max(1e-10, 1% of four-start loss).
+These configurable thresholds describe stability, not guaranteed accuracy.
+
+Artifacts in the output directory:
+
+- `manifest.json`: selected IDs written before inference, input hashes,
+  checkpoint epoch, full configuration, versions, bounds, normalization, and
+  completion/failure status.
+- `cases.csv`, `summary.json`: both recovery estimates and aggregate metrics.
+- `validation_residuals.npz/.json`: signed physical residual arrays and summaries.
+- `cases/<sim_id>/`: loss grid, physical/scaled Jacobians, optimizer evaluation
+  trace and termination records, observed/reconstructed fields, sensitivities,
+  and per-time metrics in NPZ/CSV/JSON files.
+- Recovery, start-comparison, sensitivity, validation-residual, and per-case
+  joint-loss/reconstruction PNG figures.
+
+Settings are in the `inverse` section of `conf/default.yaml`; old configs,
+datasets, and checkpoints remain loadable without this section. The command
+requires matching dataset and checkpoint provenance. Existing outputs are
+protected unless `--overwrite` is supplied, and overwrite requires a previous
+inverse manifest. Only IDs listed in the current manifest belong to that run;
+older, unselected case directories may remain. Numerical case failures are
+recorded and processing continues, with a nonzero CLI exit status if any fail.
+
 ## Tests
 
 ```bash
@@ -239,6 +323,11 @@ The suite covers:
 - **Pipeline:** a tiny CPU generate/train/evaluate run, a single-GPU smoke
   test (skipped without CUDA), and a small-data overfit check covering both
   initial and later sources.
+- **Inverse:** exact full-field observations, provenance and selection,
+  synthetic recovery (interior/edge/corner optima, narrow valleys, multiple
+  basins), hard evaluation budgets, nested-start reuse, FFT Jacobians versus
+  finite differences, rank-deficient sensitivities, physical metrics, FV
+  replay, and a tiny trained-checkpoint end-to-end test with saved figures.
 
 The pilot refinement test is marked `slow`; deselect it with `-m "not slow"`.
 
@@ -246,8 +335,9 @@ The pilot refinement test is marked `slow`; deselect it with `-m "not slow"`.
 
 The forward experiment reports held-out FNO performance against persistence,
 separately for the two source categories. It makes no claim about accuracy
-targets, inverse identifiability, or speedup. This repository deliberately
-excludes inverse scripts, autoregressive rollout studies, semigroup-consistency
+targets or speedup. The inverse experiment reports deterministic recovery and
+local surrogate identifiability diagnostics without probabilistic intervals.
+This repository deliberately excludes autoregressive rollout studies, semigroup-consistency
 losses, PINNs, additional architectures, DDP or cluster tooling, OOD suites,
 and hyperparameter sweeps.
 

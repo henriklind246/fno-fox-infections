@@ -62,3 +62,34 @@ accumulation pattern, which is the same at HEAD and in the working tree.
   safety calibration, Pareto bookkeeping, and early stopping are removed.
 - `evaluate.py`: batched inference; TPS margin and feasibility metrics replaced
   by S/I errors, persistence, and front diagnostics.
+
+## Identifiability-first inverse pipeline (2026-10-12)
+
+The inverse workflow was adapted conceptually from the active
+`no-tps-ihcp` implementation at revision
+`6f58b13bdc874dba0c3c8da3c3b1b1ec6749dea9`. These source files were clean:
+
+| Source file | SHA-256 at adaptation time |
+|---|---|
+| `scripts/invert.py` | `d96517f300f6eb4c4191b3af95c0bf9667696d846b6e31e88a80252e2e098924` |
+| `scripts/run_inverse_sensor_sweep.py` | `bba37c4e04182882eab476d4abba80cdaa628aba91ad95f959535a9334befe99` |
+
+`src/fno_fox/inverse_numerics.py` adapts the multistart optimization,
+full-box objective grid, and Jacobian-SVD diagnostic patterns. The sensitivity
+pattern was present in the reference's retired diagnostic block; it is useful
+here for the two-parameter identifiability experiment. This implementation
+uses two JVPs instead of a reverse-mode row-by-row full Jacobian, range-scaled
+coordinates, hard evaluation budgets, nested four/eight-start reuse, and
+explicit boundary searches.
+
+`src/fno_fox/inverse.py` adapts the recovery error, robust summary, provenance,
+and FV-replay conventions to S/I density fields and parameters `(D, beta)`.
+`src/fno_fox/inverse_plots.py` provides project-local artifact-driven plots.
+The implementation retains the current package's loaders, checkpoint
+normalization, initial-condition definitions, and FV solver unchanged.
+
+There is no runtime dependency on the reference repository. Sensor masks,
+measurement noise, surrogate variance calibration, effective-correlation
+factors, likelihoods, chi-squared thresholds, profile confidence intervals,
+and FV polishing are not imported. Validation residuals are descriptive
+signed error fields, and grid minima are deterministic coarse summaries.
