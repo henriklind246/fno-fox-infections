@@ -439,5 +439,73 @@ def test_cli_options_and_output_guards(tmp_path, time_fixture, monkeypatch):
     assert captured["device"] == "cpu" and captured["sim_ids"] == [1] and captured["overwrite"]
     assert main(["--config", "c", "--data", "d", "--checkpoint", "p", "--output", "o", "--all-test"]) == 0
     assert captured["all_test"]
+    assert main(["--config", "c", "--data", "d", "--checkpoint", "p", "--output", "o",
+                 "--resume", "--max-recovery-problems", "500"]) == 0
+    assert captured["resume"] and captured["max_recovery_problems"] == 500
     with pytest.raises(SystemExit):
         main(["--config", "c", "--data", "d", "--checkpoint", "p", "--output", "o", "--all-test", "--sim-ids", "1"])
+
+
+def test_capped_resume_reuses_successes_and_rejects_changed_inputs(tmp_path, time_fixture, monkeypatch):
+    import fno_fox.inverse_sensor_sweep as engine
+    config, data, checkpoint = time_fixture
+    config = replace(config, inverse=replace(config.inverse, sweep_cases=2))
+    ids = list(map(int, load_dataset(data).splits["test"][:2]))
+    original = engine.evaluate_case
+    calls = []
+    def interrupt(*args, **kwargs):
+        if len(calls) == 3:
+            raise KeyboardInterrupt()
+        calls.append((args[1], kwargs["configuration"]))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(engine, "evaluate_case", interrupt)
+    root = tmp_path / "resume"
+    with pytest.raises(KeyboardInterrupt):
+        sensor_time_sweep(config, data, checkpoint, root, device="cpu", sim_ids=ids,
+                          figures=False, verbose=False)
+    saved = {path: path.read_bytes() for path in root.rglob("result.json")}
+    assert len(saved) == 3
+    assert json.loads((root / "manifest.json").read_text())["status"] == "interrupted"
+    before = (root / "manifest.json").read_bytes()
+    changed = replace(config, inverse=replace(config.inverse, grid_size=5))
+    with pytest.raises(ValueError, match="changed recovery settings"):
+        sensor_time_sweep(changed, data, checkpoint, root, device="cpu", sim_ids=ids,
+                          figures=False, resume=True, max_recovery_problems=20)
+    assert (root / "manifest.json").read_bytes() == before
+    copied_checkpoint = tmp_path / "changed.pt"
+    payload = torch.load(checkpoint, weights_only=False)
+    payload["epoch"] += 1
+    torch.save(payload, copied_checkpoint)
+    with pytest.raises(ValueError, match="checkpoint_sha256"):
+        sensor_time_sweep(config, data, copied_checkpoint, root, device="cpu", sim_ids=ids,
+                          figures=False, resume=True, max_recovery_problems=20)
+    calls.clear()
+    def record(*args, **kwargs):
+        calls.append((args[1], kwargs["configuration"]))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(engine, "evaluate_case", record)
+    report = sensor_time_sweep(config, data, checkpoint, root, device="cpu", sim_ids=ids,
+                               figures=False, verbose=False, resume=True, max_recovery_problems=20)
+    assert len(calls) == 17 and report["completed_configuration_cases"] == 20
+    assert report["failed_cases"] == [] and report["budget_excluded_configuration_cases"] == 10
+    assert len(set(calls)) == len(calls)
+    for path, content in saved.items():
+        assert path.read_bytes() == content
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["resume"]["reused_configuration_cases"] == 3
+    for key, scheduled in manifest["scheduled_ids_by_configuration"].items():
+        assert scheduled == (ids if key.startswith("sensors_16_") else ids[:1])
+        assert report["configurations"][key]["completed_cases"] == len(scheduled)
+    calls.clear()
+    sensor_time_sweep(config, data, checkpoint, root, device="cpu", sim_ids=ids,
+                      figures=False, verbose=False, resume=True, max_recovery_problems=20)
+    assert calls == []
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 2.5, 16])
+def test_invalid_recovery_budget_before_output(tmp_path, time_fixture, budget):
+    config, data, checkpoint = time_fixture
+    root = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="max_recovery_problems"):
+        sensor_time_sweep(config, data, checkpoint, root, figures=False, max_recovery_problems=budget)
+    assert not root.exists()

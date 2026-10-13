@@ -151,20 +151,34 @@ def sensor_sweep(config: FoxConfig, data_dir, checkpoint, output_dir, *, device=
 
 
 def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=None,
-               overwrite=False, figures=True, verbose=True,
+               overwrite=False, resume=False, max_recovery_problems=None, figures=True, verbose=True,
                pipeline="fno_fox.inverse_sensor_sweep", summary_function=sweep_summary,
                comparison_plotter=None, manifest_extra=None):
     """Common execution after each entry point validates its cases and observation layouts."""
     destination = Path(output_dir).resolve()
+    if resume and overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive.")
+    schedule = [(int(sim), key) for sim in ids for key in layouts]
+    if max_recovery_problems is not None:
+        if (type(max_recovery_problems) is not int
+                or not 1 <= max_recovery_problems <= len(schedule)):
+            raise ValueError("max_recovery_problems must be a positive integer no larger than the full sweep.")
+        schedule = schedule[:max_recovery_problems]
+    scheduled = set(schedule)
+    previous = None
     for source in (bundle.root.resolve(), Path(checkpoint).resolve()):
         if source == destination or destination in source.parents:
             raise ValueError("Sensor sweep output cannot contain or replace an input dataset/checkpoint.")
     if destination.exists():
-        if not overwrite:
-            raise FileExistsError(f"Sensor sweep output already exists: {destination}; use --overwrite.")
+        if not (overwrite or resume):
+            raise FileExistsError(f"Sensor sweep output already exists: {destination}; use --overwrite or --resume.")
         marker = destination / "manifest.json"
         if not marker.exists() or json.loads(marker.read_text()).get("pipeline") != pipeline:
-            raise ValueError(f"--overwrite requires an existing {pipeline} output directory.")
+            raise ValueError(f"--overwrite/--resume requires an existing {pipeline} output directory.")
+        if resume:
+            previous = json.loads(marker.read_text())
+    elif resume:
+        raise ValueError("--resume requires an existing sweep output directory.")
     resolved = resolve_device(device or config.training.device)
     model, payload = load_checkpoint(checkpoint, resolved)
     encoder = validate_inputs(config, bundle, payload)
@@ -175,6 +189,8 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
         "checkpoint": str(Path(checkpoint).resolve()), "checkpoint_sha256": file_sha256(checkpoint),
         "checkpoint_epoch": payload["epoch"], "data": str(bundle.root.resolve()),
         "dataset_sha256": bundle.manifest["dataset_sha256"], "dataset_config_sha256": bundle.manifest["config_sha256"],
+        "checkpoint_training_dataset": payload.get("dataset"),
+        "test_extension": bundle.manifest.get("test_extension"),
         "selected_ids": ids, "selected_count": len(ids), "validation_ids": bundle.splits["val"],
         "sensor_layouts": layouts, "observation_times": bundle.times[1:], "channels": ["S", "I"],
         "sensor_selection": "rint(linspace(0, Nx-1, count)); grid cells; identical for both channels and all times",
@@ -187,6 +203,63 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
         "overwrite_note": "Only selected IDs and configurations in this manifest belong to this run.",
         **(manifest_extra or {}),
     }
+    rows, failures, shared_costs = [], [], {"cases": {}}
+    finished = set()
+    prior_seconds = 0.0
+    if previous is not None:
+        # Only cohort size/budget may change. All scientific inputs and settings must match.
+        old_config = previous["config"]
+        new_config = config.as_dict()
+        old_config = {**old_config, "inverse": {**old_config["inverse"]}}
+        new_config = {**new_config, "inverse": {**new_config["inverse"]}}
+        old_config["inverse"].pop("sweep_cases", None)
+        new_config["inverse"].pop("sweep_cases", None)
+        if json_safe(old_config) != json_safe(new_config):
+            raise ValueError("Cannot resume with changed recovery settings or scientific configuration.")
+        for name in ("checkpoint_sha256", "dataset_sha256", "dataset_config_sha256", "encoder",
+                     "normalization", "parameter_bounds", "sensor_layouts", "device"):
+            if previous.get(name) != json_safe(manifest[name]):
+                raise ValueError(f"Cannot resume: {name} differs from the saved run.")
+        if not set(map(int, ids)) <= set(previous["selected_ids"]):
+            raise ValueError("Resume IDs must be a subset of the saved run's selected IDs.")
+        for sim, key in schedule:
+            directory = destination / "configurations" / key / "cases" / str(sim)
+            result = directory / "result.json"
+            if result.exists():
+                saved = json.loads(result.read_text())
+                case_rows = saved["rows"]
+                layout = layouts[key]
+                if (len(case_rows) != 2 or {r["starts"] for r in case_rows} != {4, 8}
+                        or any(r["sim_id"] != sim or r["configuration"] != key
+                               or r["sensor_count"] != layout["sensor_count"]
+                               or r.get("time_count") != layout.get("time_count", bundle.n_snapshots - 1)
+                               for r in case_rows)):
+                    raise ValueError(f"Invalid saved recovery result: {result}")
+                for name in ("grid.npz", "optimizer.json", "optimizer_trace.csv", "jacobians.npz",
+                             "fields.npz", "metrics.json", "sensitivities.json"):
+                    if not (directory / name).is_file() or not (directory / name).stat().st_size:
+                        raise ValueError(f"Incomplete saved recovery result: {directory / name}")
+                rows.extend(case_rows)
+                finished.add((sim, key))
+            elif (directory / "failure.json").exists():
+                record = json.loads((directory / "failure.json").read_text())
+                if record["sim_id"] != sim or record["configuration"] != key:
+                    raise ValueError(f"Invalid saved failure: {directory}")
+                failures.append(record)
+                finished.add((sim, key))
+        costs_path = destination / "shared_costs.json"
+        if costs_path.exists():
+            shared_costs = json.loads(costs_path.read_text())
+            shared_costs["cases"] = {k: v for k, v in shared_costs["cases"].items() if int(k) in ids}
+            prior_seconds = sum(v.get("wall_seconds_including_grid", 0) for v in shared_costs["cases"].values())
+            prior_seconds += shared_costs.get("validation", {}).get("wall_seconds", 0)
+        manifest["resume"] = {"reused_configuration_cases": len(rows) // 2,
+                              "reused_failures": len(failures), "prior_recorded_work_seconds": prior_seconds}
+        write_json(destination / "manifest_before_resume.json", previous)
+    manifest.update(planned_recovery_problems=len(schedule), max_recovery_problems=max_recovery_problems,
+                    scheduled_ids_by_configuration={key: [sim for sim, k in schedule if k == key] for key in layouts},
+                    budget_selection="Trajectory order, then configuration order; cap counts each case/layout once, including failures.",
+                    budget_excluded_configuration_cases=len(ids) * len(layouts) - len(schedule))
     write_json(destination / "manifest.json", manifest)
     for name in ("cases.csv", "summary.json", "paired_changes.csv", "shared_costs.json",
                  "sensor_recovery.png", "sensor_replay_errors.png", "sensor_sensitivities.png", "sensor_start_stability.png"):
@@ -202,11 +275,13 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
         for name in ("cases.csv", "summary.json", "recovery.png", "start_comparison.png", "sensitivities.png",
                      "validation_residuals.png"):
             (directory / name).unlink(missing_ok=True)
-    rows, failures, shared_costs = [], [], {"cases": {}}
     begin = perf_counter()
 
     def save_reports():
         report, paired = summary_function(rows, failures, ids, layouts)
+        report.update(planned_recovery_problems=len(schedule),
+                      scheduled_ids_by_configuration=manifest["scheduled_ids_by_configuration"],
+                      budget_excluded_configuration_cases=manifest["budget_excluded_configuration_cases"])
         write_csv(destination / "cases.csv", rows)
         write_csv(destination / "paired_changes.csv", paired)
         write_json(destination / "summary.json", report)
@@ -237,20 +312,28 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                                        "wall_seconds": perf_counter() - start}
         validation_by_layout(destination, layouts)
         for sim in ids:
+            pending = {key: layout for key, layout in layouts.items()
+                       if (int(sim), key) in scheduled and (int(sim), key) not in finished}
+            if not pending:
+                continue
             if verbose:
-                print(f"Sweep case {int(sim)}: shared grid followed by {len(layouts)} configurations", flush=True)
+                print(f"Sweep case {int(sim)}: shared grid followed by {len(pending)} configurations", flush=True)
             shared = {}
             base = FieldObjective(model, encoder, observations(bundle, encoder, int(sim)), resolved, config.inverse.batch_size)
             try:
-                grids, cost = shared_joint_grids(base, layouts, config.inverse.grid_size)
+                grids, cost = shared_joint_grids(base, pending, config.inverse.grid_size)
             except (ValueError, RuntimeError) as exc:
-                for key in layouts:
+                for key in pending:
                     failure(key, sim, exc)
                 save_reports()
                 continue
+            previous_case_cost = shared_costs["cases"].get(str(int(sim)), {})
+            previous_case_seconds = previous_case_cost.get("wall_seconds_including_grid", 0)
             shared_costs["cases"][str(int(sim))] = {"grid": cost}
+            if previous_case_cost:
+                shared_costs["cases"][str(int(sim))]["before_resume"] = previous_case_cost
             case_begin = perf_counter()
-            for key, layout in layouts.items():
+            for key, layout in pending.items():
                 directory = destination / "configurations" / key / "cases" / str(int(sim))
                 try:
                     rows.extend(evaluate_case(bundle, int(sim), model, encoder, resolved, config.inverse, directory,
@@ -265,7 +348,7 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                     "unique_fv_replays": len(shared.get("fv", {})),
                 }
                 shared_costs["cases"][str(int(sim))]["forward_queries_excluding_grid"] = shared.get("forward_queries", {})
-                shared_costs["cases"][str(int(sim))]["wall_seconds_including_grid"] = cost["wall_seconds"] + perf_counter() - case_begin
+                shared_costs["cases"][str(int(sim))]["wall_seconds_including_grid"] = previous_case_seconds + cost["wall_seconds"] + perf_counter() - case_begin
                 save_reports()
         report = save_reports()
         if figures:
@@ -274,13 +357,17 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                 plot_inverse(destination / "configurations" / key, [r for r in rows if r["configuration"] == key])
             (comparison_plotter or plot_sensor_sweep)(destination, report, layouts)
         report["wall_seconds"] = perf_counter() - begin
+        if previous is not None:
+            report["prior_recorded_work_seconds"] = prior_seconds
+            report["total_recorded_work_seconds"] = prior_seconds + report["wall_seconds"]
         write_json(destination / "summary.json", report)
         manifest.update(status="completed_with_failures" if failures else "completed",
                         completed_configuration_cases=len(rows) // 2, failed_configuration_cases=len(failures))
         write_json(destination / "manifest.json", manifest)
         return json_safe(report)
-    except Exception as exc:
-        manifest.update(status="failed", error_type=type(exc).__name__, error=str(exc))
+    except BaseException as exc:
+        manifest.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+                        error_type=type(exc).__name__, error=str(exc))
         write_json(destination / "manifest.json", manifest)
         raise
 

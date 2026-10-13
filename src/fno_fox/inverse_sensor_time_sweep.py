@@ -116,7 +116,8 @@ def sweep_summary(rows, failures, selected_ids, layouts) -> tuple[dict, list[dic
 
 
 def sensor_time_sweep(config: FoxConfig, data_dir, checkpoint, output_dir, *, device=None,
-                      sim_ids=None, all_test=False, overwrite=False, figures=True, verbose=True) -> dict:
+                      sim_ids=None, all_test=False, overwrite=False, resume=False,
+                      max_recovery_problems=None, figures=True, verbose=True) -> dict:
     config.validate()
     bundle = load_dataset(data_dir)
     ids = select_sweep_cases(bundle, config.inverse, sim_ids, all_test)
@@ -126,7 +127,8 @@ def sensor_time_sweep(config: FoxConfig, data_dir, checkpoint, output_dir, *, de
         from fno_fox.inverse_plots import plot_sensor_time_sweep
         plotter = plot_sensor_time_sweep
     return _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, device=device,
-                      overwrite=overwrite, figures=figures, verbose=verbose,
+                      overwrite=overwrite, resume=resume, max_recovery_problems=max_recovery_problems,
+                      figures=figures, verbose=verbose,
                       pipeline="fno_fox.inverse_sensor_time_sweep", summary_function=sweep_summary,
                       comparison_plotter=plotter, manifest_extra={
                           "observation_layouts": layouts, "metric_scopes": METRIC_SCOPE_LABELS,
@@ -145,10 +147,16 @@ def main(argv=None) -> int:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--sim-ids", nargs="+", type=int)
     selection.add_argument("--all-test", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
+    output_mode = parser.add_mutually_exclusive_group()
+    output_mode.add_argument("--overwrite", action="store_true")
+    output_mode.add_argument("--resume", action="store_true")
+    parser.add_argument("--max-recovery-problems", type=int,
+                        help="Cap case/layout recoveries in trajectory then configuration order; both start arms are retained.")
     args = parser.parse_args(argv)
     report = sensor_time_sweep(load_config(args.config), args.data, args.checkpoint, args.output,
-                               device=args.device, sim_ids=args.sim_ids, all_test=args.all_test, overwrite=args.overwrite)
+                               device=args.device, sim_ids=args.sim_ids, all_test=args.all_test,
+                               overwrite=args.overwrite, resume=args.resume,
+                               max_recovery_problems=args.max_recovery_problems)
     return 1 if report["failed_cases"] else 0
 
 

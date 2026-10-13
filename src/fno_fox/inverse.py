@@ -88,9 +88,13 @@ def validate_inputs(config: FoxConfig, bundle: DatasetBundle, payload: dict) -> 
     config.validate()
     check_dataset_compatibility(config, bundle)
     checkpoint_config = config_from_dict(payload["config"])
-    check_dataset_compatibility(checkpoint_config, bundle)
+    provenance_bundle = bundle
+    if "test_extension" in bundle.manifest:
+        from fno_fox.extend_test import validate_test_extension
+        provenance_bundle = validate_test_extension(bundle)
+    check_dataset_compatibility(checkpoint_config, provenance_bundle)
     for key in ("dataset_sha256", "config_sha256"):
-        if payload.get("dataset", {}).get(key) != bundle.manifest[key]:
+        if payload.get("dataset", {}).get(key) != provenance_bundle.manifest[key]:
             raise ValueError(f"Checkpoint {key} does not match dataset provenance.")
     encoder = FieldEncoder.from_dict(payload["encoder"])
     if encoder != FieldEncoder.from_bundle(bundle):
@@ -383,6 +387,8 @@ def inverse(config: FoxConfig, data_dir, checkpoint, output_dir, *, device=None,
                 "checkpoint_epoch": payload["epoch"], "data": str(bundle.root.resolve()),
                 "dataset_sha256": bundle.manifest["dataset_sha256"],
                 "dataset_config_sha256": bundle.manifest["config_sha256"],
+                "checkpoint_training_dataset": payload.get("dataset"),
+                "test_extension": bundle.manifest.get("test_extension"),
                 "selected_ids": ids, "validation_ids": bundle.splits["val"],
                 "encoder": encoder.as_dict(), "parameter_bounds": [encoder.diffusivity_range, encoder.transmission_range],
                 "observation_times": bundle.times[1:], "channels": CHANNELS,

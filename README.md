@@ -332,6 +332,31 @@ dataset/checkpoint with at least 100 test cases to run the default protocol.
 The sweep never repeats trajectories or borrows training/validation cases.
 The standalone inverse command retains `inverse.pilot_cases: 10`.
 
+To use an existing trained checkpoint with 100 **fresh** test trajectories,
+append a verified test-only extension. This retains every original field,
+parameter, split ID, and training normalization; the checkpoint is unchanged.
+The inverse loader verifies the extension against the complete original
+dataset and the checkpoint's original dataset hashes. The added trajectories
+use the same physics, solver, parameter ranges, and grid, with a new sampling
+seed and an exactly balanced initial-field family assignment.
+
+```bash
+python -m fno_fox.extend_test --data data/fox_rabies --output data/fox_rabies_test100 --count 100 --seed 6
+```
+
+For the original 600-case dataset, the new test IDs are 600 through 699.
+Run only these IDs; the extension also retains the original 90 test cases.
+On PowerShell:
+
+```powershell
+$newTestIds = 600..699
+python -m fno_fox.inverse_sensor_sweep --config data/fox_rabies_test100/config.yaml --data data/fox_rabies_test100 --checkpoint runs/default/best.pt --output runs/default/sensor_sweep_100 --device cuda --sim-ids $newTestIds
+```
+
+The extension manifest records its source dataset, hashes, new IDs and
+sampling seed. Both inverse manifests retain the checkpoint's training
+dataset provenance separately from the extended evaluation dataset.
+
 `--sim-ids` must provide exactly `inverse.sweep_cases` distinct test IDs.
 `--all-test` runs the complete test split, provided it meets that minimum.
 `--device` and `--overwrite` follow the standalone command's conventions;
@@ -425,6 +450,28 @@ before model loading or inference. This command also requires at least 16
 learning cells and as many positive snapshots as the largest requested count.
 Counts must be distinct integers of at least two; they are never reduced
 silently.
+
+Use `--max-recovery-problems 500` to cap the number of case/layout recoveries
+while retaining both start arms. The schedule follows the selected trajectory
+order, then the configuration order (16/8/4 sensors, descending time counts).
+With `inverse.sweep_cases: 34`, this runs all 15 configurations for the first
+33 trajectories (495 problems), followed by all five time counts at 16 sensors
+for the 34th trajectory. Counts are 34 per 16-sensor configuration and 33 per
+8/4-sensor configuration. The manifest records scheduled IDs per configuration
+and budget exclusions; exclusions are distinct from failed recoveries.
+
+`--resume` reuses complete per-case artifacts from an interrupted run of this
+entry point. It verifies the checkpoint and dataset hashes, normalization,
+observation layouts, device, and recovery settings before writing output. The
+selected cohort can shrink to a subset of the original IDs, and the cap can
+change; other scientific settings must match. Saved failures remain recorded.
+Partial cases without a success marker are recomputed. `--resume` and
+`--overwrite` are mutually exclusive. For the 500-problem run in this workspace:
+
+```powershell
+$testIds = 600..633
+python -m fno_fox.inverse_sensor_time_sweep --config runs/default/sensor_time_sweep_500_config.yaml --data data/fox_rabies_test100 --checkpoint runs/default/best.pt --output runs/default/sensor_time_sweep_500 --device cuda --sim-ids $testIds --max-recovery-problems 500 --resume
+```
 
 Spatial layouts match the existing sweep. Temporal layouts are approximately
 uniform **nested subsets of saved positive times**. The smallest count starts
