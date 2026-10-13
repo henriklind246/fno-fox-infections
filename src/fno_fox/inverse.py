@@ -34,6 +34,12 @@ METRIC_SCOPE_LABELS = {
     "full_grid_selected_times": "Evaluation against ground truth: all cells at selected times, including spatially withheld values.",
     "full_grid": "Evaluation against ground truth: all cells at all saved positive times, including spatially and temporally withheld values.",
 }
+CHANNEL_SCOPE_LABELS = {
+    **METRIC_SCOPE_LABELS,
+    "sensor": "Fitting observations: selected channels at selected sensors and selected positive times.",
+    "full_grid_selected_times": "Evaluation against ground truth: both S and I, all cells at selected times, including withheld channels and cells.",
+    "full_grid": "Evaluation against ground truth: both S and I, all cells at all saved positive times, including withheld channels, cells, and times.",
+}
 
 
 def json_safe(value):
@@ -57,8 +63,10 @@ def write_json(path: Path, payload: dict) -> None:
 def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
+    # Rows from configurations observing different channels carry different metric columns.
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(json_safe(rows))
 
@@ -119,11 +127,12 @@ def validate_inputs(config: FoxConfig, bundle: DatasetBundle, payload: dict) -> 
     return encoder
 
 
-def field_metrics(prediction: np.ndarray, truth: np.ndarray, times: np.ndarray) -> dict:
+def field_metrics(prediction: np.ndarray, truth: np.ndarray, times: np.ndarray, channels=CHANNELS) -> dict:
+    """Metrics per named channel; ``channels`` names the last axis of both arrays."""
     prediction, truth = np.asarray(prediction, dtype=np.float64), np.asarray(truth, dtype=np.float64)
     error = prediction - truth
     result = {}
-    for ch, name in enumerate(CHANNELS):
+    for ch, name in enumerate(channels):
         err, ref = error[..., ch], truth[..., ch]
         squared, reference = np.mean(err ** 2, axis=-1), np.mean(ref ** 2, axis=-1)
         rms_ref = np.sqrt(np.mean(ref ** 2))
@@ -139,7 +148,7 @@ def field_metrics(prediction: np.ndarray, truth: np.ndarray, times: np.ndarray) 
     return result
 
 
-def residual_summary(residuals: np.ndarray) -> tuple[dict, dict]:
+def residual_summary(residuals: np.ndarray, channels=CHANNELS) -> tuple[dict, dict]:
     residuals = np.asarray(residuals, dtype=np.float64)
     arrays = {
         "signed_mean": residuals.mean(axis=0),
@@ -154,7 +163,7 @@ def residual_summary(residuals: np.ndarray) -> tuple[dict, dict]:
     }
     report = {name: {"bias": float(residuals[..., k].mean()),
                      "rmse": float(np.sqrt(np.mean(residuals[..., k] ** 2)))}
-              for k, name in enumerate(CHANNELS)}
+              for k, name in enumerate(channels)}
     return report, arrays
 
 
@@ -190,7 +199,8 @@ def fv_replay(bundle, sim, theta):
 
 
 def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
-                  sensor_indices=None, time_indices=None, grid=None, shared=None, configuration=None):
+                  sensor_indices=None, time_indices=None, channel_indices=None, grid=None, shared=None,
+                  configuration=None):
     directory.mkdir(parents=True, exist_ok=True)
     for name in ("failure.json", "result.json", "metrics.json", "sensitivities.json",
                  "grid.npz", "optimizer.json", "optimizer_trace.csv", "fields.npz", "jacobians.npz",
@@ -204,8 +214,12 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
     prediction_stats = shared.setdefault("forward_queries", {"parameter_predictions": 0, "field_queries": 0,
                                                             "cache_hits": 0}) if cache_enabled else None
     objective = FieldObjective(model, encoder, obs, device, config.batch_size, sensor_indices,
-                               prediction_cache, prediction_stats, time_indices=time_indices)
-    selected_observations = sensor_indices is not None or time_indices is not None
+                               prediction_cache, prediction_stats, time_indices=time_indices,
+                               channel_indices=channel_indices)
+    selected_observations = sensor_indices is not None or time_indices is not None or channel_indices is not None
+    # Callers that declare channels also record channel metadata; older callers keep their schema.
+    channel_declared = channel_indices is not None
+    observed_channels = tuple(CHANNELS[k] for k in objective.channel_indices)
     if grid is None:
         grid = joint_grid(objective.losses, config.grid_size)
     full_jacobians = shared.setdefault("jacobians", {})
@@ -228,8 +242,13 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
                 full_jacobians[key] = objective.full_jacobians(point)
                 shared_cost["jacobian_wall_seconds"] += perf_counter() - start
             physical, scaled = select_jacobians(*full_jacobians[key], objective.sensor_indices,
-                                               objective.time_indices)
-            cache[key] = physical, scaled, sensitivity_summary(scaled)
+                                               objective.time_indices, channel_indices=objective.channel_indices)
+            summary = sensitivity_summary(scaled)
+            if channel_declared:
+                largest, smallest = summary["singular_values"]
+                summary.update(singular_value_ratio=smallest / largest if largest > 0 else None,
+                               observed_channels=list(observed_channels))
+            cache[key] = physical, scaled, summary
         physical, scaled, report = cache[key]
         sensitivities[label] = {"theta": objective.physical_parameters(point), **report}
         sensitivity_arrays[f"{label}_physical"] = physical
@@ -265,7 +284,8 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
                         for name, (pred, truth) in comparisons.items()}
         metrics[arm] = full_metrics if not selected_observations else {
             "full_grid": full_metrics,
-            "sensor": {name: field_metrics(objective.observe(pred), objective.observe(truth), objective.observed_times)
+            "sensor": {name: field_metrics(objective.observe(pred), objective.observe(truth), objective.observed_times,
+                                           observed_channels)
                        for name, (pred, truth) in comparisons.items()},
         }
         if time_indices is not None:
@@ -280,9 +300,12 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
                "loss_change_flag": result["loss_change_flag"], "loss_improvement": result["loss_improvement"]}
         if configuration is not None:
             row.update(configuration=configuration, sensor_count=len(objective.sensor_indices),
-                       observed_scalars=len(objective.time_indices) * len(objective.sensor_indices) * 2)
+                       observed_scalars=len(objective.time_indices) * len(objective.sensor_indices)
+                       * len(objective.channel_indices))
             if time_indices is not None:
                 row["time_count"] = len(objective.time_indices)
+        if channel_declared:
+            row["observed_channels"] = "/".join(observed_channels)
         for k, name in enumerate(PARAMETERS):
             error = float(theta[k] - theta_true[k])
             row.update({f"{name}_true": float(theta_true[k]), f"{name}_hat": float(theta[k]),
@@ -301,16 +324,29 @@ def evaluate_case(bundle, sim, model, encoder, device, config, directory, *,
             row[f"sensitivity_{name}"] = report["column_norms"][k]
             row[f"singular_value_{k}"] = report["singular_values"][k]
         row.update({k: report[k] for k in ("condition_number", "column_cosine", "numerical_rank")})
+        if channel_declared:
+            weakest = report["weakest_direction"] or [None] * len(PARAMETERS)
+            row["singular_value_ratio"] = report["singular_value_ratio"]
+            row.update({f"weakest_direction_{name}": weakest[k] for k, name in enumerate(PARAMETERS)})
         rows.append(row)
+    channel_arrays = {"channel_indices": objective.channel_indices} if channel_declared else {}
     np.savez_compressed(directory / "jacobians.npz", times=objective.observed_times,
                         time_indices=objective.time_indices,
                         x_centers=bundle.x_centers[objective.sensor_indices], sensor_indices=objective.sensor_indices,
-                        parameter_names=np.array(PARAMETERS), channel_names=np.array(CHANNELS), **sensitivity_arrays)
+                        parameter_names=np.array(PARAMETERS), channel_names=np.array(observed_channels),
+                        **channel_arrays, **sensitivity_arrays)
+    # Fields always keep both channels; the observed-channel mask is stored beside them.
+    field_channels = ({"observed_channel_indices": objective.channel_indices,
+                       "field_channel_names": np.array(CHANNELS)} if channel_declared else {})
     np.savez_compressed(directory / "fields.npz", times=obs.times, x_centers=bundle.x_centers,
                         sensor_indices=objective.sensor_indices, time_indices=objective.time_indices,
-                        observed=obs.physical_targets,
+                        observed=obs.physical_targets, **field_channels,
                         initial=np.stack((bundle.susceptible[sim, 0], bundle.infectious[sim, 0]), axis=-1), **predictions)
-    if time_indices is not None:
+    if channel_declared:
+        metrics["scope_labels"] = {scope: CHANNEL_SCOPE_LABELS[scope] for scope in metrics["8"]}
+        metrics["channel_roles"] = {name: "fitted" if name in observed_channels else "evaluation_only"
+                                    for name in CHANNELS}
+    elif time_indices is not None:
         metrics["scope_labels"] = METRIC_SCOPE_LABELS
     write_json(directory / "metrics.json", metrics)
     write_json(directory / "sensitivities.json", sensitivities)

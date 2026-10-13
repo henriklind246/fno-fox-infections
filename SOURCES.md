@@ -116,3 +116,15 @@ reference code was copied. Selected observations enter fitting, while
 complete fields at selected and unselected times remain explicitly labeled
 evaluation ground truth. Paired references hold either spatial or temporal
 selection fixed. Diagnostics remain deterministic and noiseless.
+
+## Five-time I-only versus S/I sweep
+
+`src/fno_fox/inverse_infected_sensor_sweep.py` adds the project-local
+32/16/8-sensor I-only and 16/8-sensor S/I protocol at five fixed positive
+times. It reuses the sweep runner, case selection, optimizer, JVP
+sensitivities, FV replay, shared caches, and artifact-driven plotting.
+`FieldObjective`, `evaluate_case`, and `select_jacobians` gain an optional
+channel mask that defaults to both channels. No additional reference code was
+copied. Unobserved channels, cells, and times remain evaluation ground truth.
+Paired I-only, sensor-count, and equal-scalar-budget comparisons do not pair
+differently normalized losses. Diagnostics remain deterministic and noiseless.

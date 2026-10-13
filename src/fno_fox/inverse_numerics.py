@@ -44,7 +44,7 @@ class FieldObjective:
 
     def __init__(self, model, encoder: FieldEncoder, obs: FullFieldObservations,
                  device: torch.device, batch_size: int, sensor_indices=None,
-                 prediction_cache=None, prediction_stats=None, *, time_indices=None):
+                 prediction_cache=None, prediction_stats=None, *, time_indices=None, channel_indices=None):
         self.model = model.eval()
         self.model.requires_grad_(False)
         self.encoder, self.obs = encoder, obs
@@ -68,13 +68,21 @@ class FieldObjective:
                 or np.any(indices[1:] <= indices[:-1])):
             raise ValueError("Time indices must be distinct, increasing integer positive-time indices.")
         self.time_indices = indices.astype(np.int64)
+        nc = obs.targets.shape[-1]
+        indices = np.arange(nc) if channel_indices is None else np.asarray(channel_indices)
+        if (indices.ndim != 1 or not len(indices) or indices.dtype.kind not in "iu"
+                or np.any(indices < 0) or np.any(indices >= nc)
+                or np.any(indices[1:] <= indices[:-1])):
+            raise ValueError("Channel indices must be distinct, increasing integer output-channel indices.")
+        self.channel_indices = indices.astype(np.int64)
 
     @property
     def observed_times(self) -> np.ndarray:
         return self.obs.times[self.time_indices]
 
     def observe(self, fields: np.ndarray) -> np.ndarray:
-        return np.take(np.take(fields, self.time_indices, axis=-3), self.sensor_indices, axis=-2)
+        selected = np.take(np.take(fields, self.time_indices, axis=-3), self.sensor_indices, axis=-2)
+        return np.take(selected, self.channel_indices, axis=-1)
 
     def physical_parameters(self, z: np.ndarray) -> np.ndarray:
         return self.low + np.asarray(z) * self.ranges
@@ -139,7 +147,8 @@ class FieldObjective:
 
     def jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         physical, scaled = self.full_jacobians(z)
-        return select_jacobians(physical, scaled, self.sensor_indices, self.time_indices)
+        return select_jacobians(physical, scaled, self.sensor_indices, self.time_indices,
+                                channel_indices=self.channel_indices)
 
     def full_jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Physical J[..., output_channel, parameter] and dimensionless flattened Js."""
@@ -163,11 +172,17 @@ class FieldObjective:
         return physical, scaled
 
 
-def select_jacobians(physical: np.ndarray, scaled: np.ndarray, indices: np.ndarray, time_indices=None):
+def select_jacobians(physical: np.ndarray, scaled: np.ndarray, indices: np.ndarray, time_indices=None,
+                     *, channel_indices=None):
+    """Restrict full [time, cell, channel, parameter] Jacobians; rescale by the selected scalar count."""
     time_indices = np.arange(len(physical)) if time_indices is None else time_indices
-    selected = np.take(np.take(physical, time_indices, axis=0), indices, axis=1)
-    selected_scaled = np.take(np.take(scaled.reshape(physical.shape), time_indices, axis=0),
-                             indices, axis=1).reshape(-1, 2)
+    channel_indices = np.arange(physical.shape[2]) if channel_indices is None else channel_indices
+
+    def take(values):
+        return np.take(np.take(np.take(values, time_indices, axis=0), indices, axis=1), channel_indices, axis=2)
+
+    selected = take(physical)
+    selected_scaled = take(scaled.reshape(physical.shape)).reshape(-1, 2)
     selected_scaled *= np.sqrt(len(scaled) / len(selected_scaled))
     return selected, selected_scaled
 
@@ -210,7 +225,7 @@ def joint_grid(losses: Callable, size: int) -> dict:
 
 
 def shared_joint_grids(objective: FieldObjective, layouts: dict, size: int) -> tuple[dict, dict]:
-    """One full-grid forward per parameter pair, reduced for every sensor layout."""
+    """One full-grid forward per parameter pair, reduced for every observation layout."""
     axis = np.linspace(0, 1, size)
     d, beta = np.meshgrid(axis, axis, indexing="ij")
     points = np.stack((d.ravel(), beta.ravel()), axis=-1)
@@ -221,13 +236,15 @@ def shared_joint_grids(objective: FieldObjective, layouts: dict, size: int) -> t
         values = objective.predict_many(points[first:first + batch]).astype(np.float64)
         residual = values - objective.obs.targets
         for name, layout in layouts.items():
-            # Older spatial sweeps supply bare sensor arrays; time sweeps supply both masks.
+            # Older spatial sweeps supply bare sensor arrays; later sweeps add time/channel masks.
+            channels = np.arange(residual.shape[-1])
             if isinstance(layout, dict):
                 indices = layout["indices"]
                 times = layout.get("time_indices", np.arange(len(objective.times)))
+                channels = layout.get("channel_indices", channels)
             else:
                 indices, times = layout, np.arange(len(objective.times))
-            selected = np.take(np.take(residual, times, axis=1), indices, axis=2)
+            selected = np.take(np.take(np.take(residual, times, axis=1), indices, axis=2), channels, axis=3)
             losses[name][first:first + len(values)] = .5 * np.mean(selected ** 2, axis=(1, 2, 3))
     grids = {}
     for name, values in losses.items():

@@ -581,6 +581,108 @@ arm costs already contain the first four starts and boundary searches:
 **do not add four-start and eight-start totals** or count shared grid costs
 once per configuration.
 
+### 8. Five-time I-only versus S/I inverse sweep
+
+```bash
+python -m fno_fox.inverse_infected_sensor_sweep --config conf/default.yaml --data data/fox_rabies --checkpoint runs/default/best.pt --output runs/default/infected_sensor_sweep
+```
+
+This command recovers **D and beta** from five fixed positive observation
+times. It compares fitting only the infectious channel with fitting both
+channels on the same trajectories:
+
+| Configuration | Sensors | Channels | Scalar observations | Purpose |
+|---|---:|---|---:|---|
+| `sensors_32_times_5_channels_I` | 32 | I | 160 | Higher-density I-only reference |
+| `sensors_16_times_5_channels_I` | 16 | I | 80 | Matched channel comparison |
+| `sensors_8_times_5_channels_I` | 8 | I | 40 | Matched channel comparison |
+| `sensors_16_times_5_channels_SI` | 16 | S, I | 160 | Recomputed baseline |
+| `sensors_8_times_5_channels_SI` | 8 | S, I | 80 | Recomputed baseline |
+
+Each trajectory schedules its configurations in table order. The default
+cohort uses 100 matched test trajectories (`inverse.sweep_cases`), giving
+500 case/configuration recoveries and 1,000 four/eight-start result rows.
+Case selection and the `--sim-ids`, `--all-test`, `--device`, `--overwrite`,
+`--resume`, and `--max-recovery-problems` options follow section 7.
+Overwrite and resume require a manifest from this entry point. The current
+90-case test split fails before model loading or output creation. The
+command also rejects grids with fewer than 32 learning cells and datasets with
+fewer than five positive snapshots. Nothing is retrained or regenerated. The
+current FNO and known initial S/I fields are retained.
+
+The five times are `nested_time_layouts(positive_times, (5,))`, equivalent to
+`rint(linspace(0, N_positive-1, 5))`, independent of
+`inverse.sweep_time_counts`. The default dataset uses t = 0.25, 1.5, 2.75,
+3.75, and 5.0, matching the five-time layout in section 7. Sensors use
+`rint(linspace(0, Nx-1, count))` and are shared by every observed channel
+and time. Layouts at 16 and 8 sensors are identical for I-only and S/I
+configurations. Layouts for different counts are approximately uniform but
+**not nested**, so sensor-count comparisons change both count and placement.
+
+Each loss is `0.5 * mean(normalized residual²)` over its selected
+observations. I-only residuals use the checkpoint's I scale; S/I residuals
+use their respective channel scales. Different channel sets therefore have
+**differently normalized losses**, which are never paired or compared
+directly. The full-grid shared loss surfaces, prediction cache, Jacobians,
+and FV replays retain both S and I fields and are reduced by time, sensor,
+and channel masks. With matching IDs, checkpoint, and recovery settings,
+the S/I baselines reproduce section 7's `sensors_16_times_5` and
+`sensors_8_times_5` results. They are recomputed here, not imported.
+
+`jacobians.npz` stores physical derivatives with respect to D and beta,
+shaped `[5, sensors, observed channels, 2]`; I-only cases have one channel.
+Scaled matrices have shape `[m, 2]`:
+`J_scaled = diag(1 / channel_scale) * J_physical * diag(parameter_ranges) / sqrt(m)`,
+where `m = 5 * sensors * observed channels`. This matches the objective in
+unit-box coordinates and gives the two columns compatible units. Reports
+include singular values, condition number, numerical rank, column cosine,
+and the weakest unit-box parameter direction. Interpretation centres on the
+smallest singular value (`singular_value_1`) and its ratio to the largest
+(`singular_value_ratio`). These are **local FNO sensitivity diagnostics**,
+not a structural identifiability claim.
+
+Metric scopes follow section 7, with channel roles made explicit. `sensor`
+metrics cover only fitted channels at fitted cells and times; I-only
+configurations have no sensor-scope S metrics. `full_grid_selected_times`
+and `full_grid` evaluate both S and I against ground truth. `metrics.json`
+records `channel_roles`, which mark S `evaluation_only` for I-only
+configurations. Reconstruction plots label S accordingly and mark fitted
+sensors only on fitted channels at fitted times. Per-configuration validation
+residuals are restricted to fitted channels. Shared full-grid S/I validation
+diagnostics remain at the output root.
+
+Paired comparisons use identical trajectory IDs, times, positions, recovery
+settings, and start seeds. Each change is current minus reference:
+
+| Kind | Current | Reference |
+|---|---|---|
+| `channel` | 16-sensor I-only; 8-sensor I-only | S/I at the same sensors (**I-only minus S/I**) |
+| `sensor_count` | 16-sensor I-only; 8-sensor I-only | 32-sensor I-only |
+| `equal_scalar_budget` | 32-sensor I-only | 16-sensor S/I (160 scalars each) |
+
+Paired changes cover parameter errors, start stability, optimizer
+evaluations and nonconvergence counts, and sensitivity diagnostics. They
+also include the sign-invariant angle between weakest directions.
+Replay changes are restricted to metrics present in both configurations:
+common I metrics at fitted cells and times, plus full-grid S/I evaluation.
+Each comparison reports completed pairs, unpaired IDs (including those
+caused by failures), and current/reference optimizer nonconvergence.
+
+The output follows sections 6–7: `manifest.json` (layouts, observed and
+full-field channels, scalar counts, normalization and Jacobian conventions,
+and comparisons, written before inference), `cases.csv`, `summary.json`,
+`paired_changes.csv`, `shared_costs.json`, shared validation artifacts, and
+`configurations/<name>/cases/<sim_id>/`. CSV columns are the union across
+channel sets, so absent sensor-scope S metrics are blank for I-only rows.
+Root figures are `infected_sensor_recovery.png`,
+`infected_sensor_sensitivities.png`, `infected_sensor_replay_errors.png`,
+`infected_sensor_start_stability.png`,
+`infected_sensor_channel_comparison.png` (matched channel and equal-budget
+pairs), and `infected_sensor_count_comparison.png`. Main results use eight
+starts, with interquartile spread rather than confidence bounds. `--resume`
+also verifies saved channel layouts, observed-channel labels, and scalar
+counts before reuse.
+
 ## Tests
 
 ```bash
@@ -613,6 +715,13 @@ The suite covers:
   baseline, isolation from unobserved cells and times, selected Jacobian
   scaling, three evaluation scopes, paired references along both axes,
   shared caches, early validation, and a tiny all-15-configuration fixture.
+- **I-only versus S/I sweep:** the five fixed times and table-order layouts,
+  isolation of I-only fits from changed later-time S targets, shared-grid
+  versus direct losses, exact scalar counts, channel-selected and
+  range-scaled Jacobians, saved channel names, paired channel/sensor-count/
+  equal-budget summaries, recomputed baselines matching the temporal sweep,
+  failure handling, capped resume checks, and figures in a tiny
+  five-configuration fixture.
 
 The pilot refinement test is marked `slow`; deselect it with `-m "not slow"`.
 

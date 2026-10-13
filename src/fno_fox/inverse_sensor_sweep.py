@@ -18,7 +18,7 @@ import torch
 from fno_fox.config import FoxConfig, load_config
 from fno_fox.data import capture_git_state, file_sha256, load_dataset
 from fno_fox.inverse import (
-    aggregate, distribution, evaluate_case, json_safe, residual_summary, select_cases,
+    CHANNELS, aggregate, distribution, evaluate_case, json_safe, residual_summary, select_cases,
     validate_inputs, validation_residuals, write_csv, write_json,
 )
 from fno_fox.inverse_numerics import FieldObjective, observations, shared_joint_grids
@@ -63,16 +63,21 @@ def validation_by_layout(root: Path, layouts: dict) -> None:
         directory = root / "configurations" / key
         directory.mkdir(parents=True, exist_ok=True)
         time_indices = layout.get("time_indices", np.arange(len(times)))
-        selected = np.take(np.take(residuals, time_indices, axis=1), layout["indices"], axis=2)
-        physical, arrays = residual_summary(selected)
-        normalized, _ = residual_summary(selected / std)
+        channels = np.asarray(layout.get("channel_indices", np.arange(len(CHANNELS))))
+        names = [CHANNELS[k] for k in channels]
+        selected = np.take(np.take(np.take(residuals, time_indices, axis=1), layout["indices"], axis=2), channels, axis=3)
+        physical, arrays = residual_summary(selected, names)
+        normalized, _ = residual_summary(selected / std[channels], names)
+        channel_metadata = ({"channel_indices": channels, "channel_names": np.array(names)}
+                            if "channel_indices" in layout else {})
         np.savez_compressed(directory / "validation_residuals.npz", residuals=selected,
                             simulation_ids=ids, times=times[time_indices], time_indices=time_indices,
                             sensor_indices=layout["indices"],
-                            x_centers=layout["x_centers"], **arrays)
+                            x_centers=layout["x_centers"], **channel_metadata, **arrays)
         write_json(directory / "validation_residuals.json", {
             "simulation_ids": ids, "sensor_count": layout["sensor_count"],
             "time_count": len(time_indices), "times": times[time_indices],
+            **({"observed_channels": names} if channel_metadata else {}),
             "physical": physical, "normalized": normalized,
             "purpose": "Descriptive signed surrogate discrepancies; no likelihood or bias correction.",
             "selection_note": "Validation also selected the training checkpoint.",
@@ -229,10 +234,14 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                 saved = json.loads(result.read_text())
                 case_rows = saved["rows"]
                 layout = layouts[key]
+                time_count = layout.get("time_count", bundle.n_snapshots - 1)
+                channel_count = len(layout.get("channel_indices", CHANNELS))
                 if (len(case_rows) != 2 or {r["starts"] for r in case_rows} != {4, 8}
                         or any(r["sim_id"] != sim or r["configuration"] != key
                                or r["sensor_count"] != layout["sensor_count"]
-                               or r.get("time_count") != layout.get("time_count", bundle.n_snapshots - 1)
+                               or r.get("time_count") != time_count
+                               or r.get("observed_scalars") != layout["sensor_count"] * time_count * channel_count
+                               or r.get("observed_channels") != layout.get("channel_label")
                                for r in case_rows)):
                     raise ValueError(f"Invalid saved recovery result: {result}")
                 for name in ("grid.npz", "optimizer.json", "optimizer_trace.csv", "jacobians.npz",
@@ -268,6 +277,10 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                  "sensor_time_replay_errors_full_grid_selected_times.png", "sensor_time_replay_errors_full_grid.png",
                  "sensor_time_sensitivities.png",
                  "sensor_time_start_stability.png"):
+        (destination / name).unlink(missing_ok=True)
+    for name in ("infected_sensor_recovery.png", "infected_sensor_channel_comparison.png",
+                 "infected_sensor_count_comparison.png", "infected_sensor_sensitivities.png",
+                 "infected_sensor_replay_errors.png", "infected_sensor_start_stability.png"):
         (destination / name).unlink(missing_ok=True)
     for key in layouts:
         directory = destination / "configurations" / key
@@ -339,6 +352,7 @@ def _run_sweep(config, bundle, checkpoint, output_dir, ids, layouts, *, device=N
                     rows.extend(evaluate_case(bundle, int(sim), model, encoder, resolved, config.inverse, directory,
                                               sensor_indices=layout["indices"], grid=grids[key], shared=shared,
                                               time_indices=layout.get("time_indices"),
+                                              channel_indices=layout.get("channel_indices"),
                                               configuration=key))
                 except (ValueError, RuntimeError) as exc:
                     failure(key, sim, exc)
