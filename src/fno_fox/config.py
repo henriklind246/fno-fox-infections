@@ -207,6 +207,7 @@ class EvaluationConfig:
 class InverseConfig:
     pilot_cases: int = 10
     sweep_cases: int = 100
+    sweep_time_counts: tuple[int, ...] = (20, 15, 10, 7, 5)
     selection_seed: int = 0
     start_seed: int = 0
     grid_size: int = 25
@@ -225,6 +226,10 @@ class InverseConfig:
 
         if self.grid_size < 3:
             raise ValueError("inverse.grid_size must be at least 3.")
+        if (not isinstance(self.sweep_time_counts, (list, tuple)) or not self.sweep_time_counts
+                or any(type(count) is not int or count < 2 for count in self.sweep_time_counts)
+                or len(set(self.sweep_time_counts)) != len(self.sweep_time_counts)):
+            raise ValueError("inverse.sweep_time_counts must contain distinct integers of at least two.")
         if min(self.pilot_cases, self.sweep_cases, self.batch_size, self.max_iterations,
                self.max_evaluations, self.edge_max_evaluations) < 1:
             raise ValueError("inverse counts and optimization budgets must be positive.")
@@ -313,6 +318,10 @@ def _build(cls: type, payload: dict[str, Any] | None, path: str) -> Any:
             values[name] = _build(type(default), raw, key)
         elif spec.type == "Range":
             values[name] = _range(raw, key)
+        elif spec.type == "tuple[int, ...]":
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError(f"{key} must contain distinct integers of at least two.")
+            values[name] = tuple(raw)
         elif isinstance(default, tuple):
             values[name] = tuple(float(item) for item in raw)
         elif isinstance(default, bool):

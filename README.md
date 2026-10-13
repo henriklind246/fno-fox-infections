@@ -401,6 +401,139 @@ only use matching successful cases and explicitly count exclusions. On
 overwrite, only IDs listed in the current manifest belong to the new run;
 older unselected case directories may remain.
 
+### 7. Paired spatial-and-temporal inverse sweep
+
+```bash
+python -m fno_fox.inverse_sensor_time_sweep --config conf/default.yaml --data data/fox_rabies --checkpoint runs/default/best.pt --output runs/default/sensor_time_sweep
+```
+
+This command combines **16, 8, and 4 spatial sensors** with **20, 15, 10, 7,
+and 5 positive observation times**, giving 15 configurations and 1,500
+recovery problems for the same 100 unique test trajectories. Every problem
+retains the four/eight-start comparison; the first four starts are reused,
+so those comparisons do not double the optimization work. All configurations
+are computed afresh. There is no import of previous sweep results.
+
+`inverse.sweep_time_counts: [20, 15, 10, 7, 5]` controls the temporal counts;
+the three spatial counts are fixed. Existing configuration files and
+checkpoints acquire these defaults without regeneration. Existing commands
+retain their observation-selection behavior. Case selection and the
+`--sim-ids`, `--all-test`, `--device`, and `--overwrite` arguments follow the
+spatial sweep. Overwrite requires a manifest from this new entry point.
+The current 90-case test split still fails the default 100-case requirement
+before model loading or inference. This command also requires at least 16
+learning cells and as many positive snapshots as the largest requested count.
+Counts must be distinct integers of at least two; they are never reduced
+silently.
+
+Spatial layouts match the existing sweep. Temporal layouts are approximately
+uniform **nested subsets of saved positive times**. The smallest count starts
+with `rint(linspace(0, N_positive-1, count))`. Additional observations split
+the largest interval containing unused snapshots, choosing the saved time
+nearest its midpoint. Ties choose the earlier interval or timestamp, allowing
+for floating-point roundoff. This gives
+`T5 ⊂ T7 ⊂ T10 ⊂ T15 ⊂ T20`, with the first and last positive times included.
+The 20-time configurations use all positive snapshots in the default dataset,
+and therefore match the corresponding original 16/8/4-sensor experiments
+when IDs, checkpoint, and optimizer settings match. If a dataset has more
+than 20 positive snapshots, 20 denotes a selected subset instead.
+
+No noise or temporal interpolation is introduced. Both complete initial
+S/I fields remain known; each prediction is queried directly from those
+fields. Only selected cells and times enter fitting or observation Jacobians.
+The scaled Jacobian uses `m = 2 * sensor_count * time_count`, recorded as
+`observed_scalars`. Joint grids, validation predictions, full Jacobians,
+and repeated diagnostic/FV calculations are shared within a trajectory.
+Cached forward outputs span every saved positive time, so actual query cost
+does not scale solely with the fitted time count. Each configuration still
+has its own loss surface, grid-minimum first start, optimization, and recovery.
+
+Both start counts report all three field comparisons, with physical S/I bias,
+RMSE, and relative L2 overall and by time, under these scopes:
+
+| Scope | Evaluated values | Role |
+|---|---|---|
+| `sensor` | Selected cells at selected times | Fitting observations |
+| `full_grid_selected_times` | All cells at selected times | Evaluation against ground truth, including spatially withheld values |
+| `full_grid` | All cells at all saved positive times | Evaluation against ground truth, including spatially and temporally withheld values |
+
+The complete reference fields in the last two scopes do not enter the fitting
+loss. These scopes describe the domains of comparison, including when the
+comparison is FNO-versus-FV. Parameter metrics, local sensitivities, solver
+budgets, explicit boundary checks, and nonconvergence records are retained.
+There are no confidence bounds or probabilistic discrepancy models.
+
+The output retains `manifest.json`, `cases.csv`, `summary.json`,
+`paired_changes.csv`, `shared_costs.json`, and shared validation artifacts.
+The manifest saves IDs and all observation layouts before inference, including
+actual timestamps and zero-based indices into the positive snapshots.
+`configurations/sensors_<count>_times_<count>/cases/<sim_id>/` contains grids,
+optimizer traces, full fields with selection masks, selected Jacobians,
+metrics, and figures. Reconstruction plots mark fitted observations only at
+fitted times and label other target fields as evaluation ground truth.
+Root comparison figures are `sensor_time_recovery.png`,
+`sensor_time_replay_errors_<scope>.png`, `sensor_time_sensitivities.png`, and
+`sensor_time_start_stability.png`. They use time count on the horizontal axis
+and separate spatial-layout curves; main results use eight starts, with
+interquartile spread rather than confidence bounds.
+
+Paired **temporal** changes compare against 20 times at the same sensor count
+(the largest count if defaults are overridden). Paired **spatial** changes
+compare against 16 sensors at the same time count. Differences are current
+minus reference, matching simulation ID and start count. Reports explicitly
+count pairs and exclusions, with nonconvergence separate from failed cases.
+Failures preserve partial artifacts and give a nonzero CLI status. Older
+unselected case directories may remain on overwrite; the current manifest
+identifies the run's cases.
+
+#### Optional two-trajectory benchmark
+
+Before the production sweep, benchmark the same model and optimizer settings
+on two trajectories selected from the intended production cohort. The
+following preparation script reads the dataset and selects IDs; it performs
+no inference. Use your matching dataset/configuration with at least 100 test
+cases. It chooses one case from each family when both are available and fills
+from the cohort otherwise:
+
+```python
+from dataclasses import replace
+from pathlib import Path
+import numpy as np
+import yaml
+from fno_fox.config import load_config
+from fno_fox.data import load_dataset
+from fno_fox.inverse_sensor_sweep import select_sweep_cases
+
+config = load_config("conf/default.yaml")
+bundle = load_dataset("data/fox_rabies")
+cohort = select_sweep_cases(bundle, config.inverse)
+family = bundle.parameters["susceptible_constant"][cohort].astype(bool)
+chosen = [int(cohort[family == value][0]) for value in (True, False)
+          if np.any(family == value)]
+chosen.extend(int(sim) for sim in cohort if int(sim) not in chosen)
+ids = chosen[:2]
+benchmark = replace(config, inverse=replace(config.inverse, sweep_cases=2))
+Path("conf/sensor_time_benchmark.yaml").write_text(yaml.safe_dump(benchmark.as_dict()))
+print("Benchmark --sim-ids:", *ids)
+```
+
+Run the benchmark explicitly, replacing the IDs below with those printed:
+
+```bash
+python -m fno_fox.inverse_sensor_time_sweep --config conf/sensor_time_benchmark.yaml --data data/fox_rabies --checkpoint runs/default/best.pt --output runs/default/sensor_time_benchmark --sim-ids <first-id> <second-id>
+```
+
+This runs 30 recovery problems with all production optimization budgets and
+never launches the larger experiment automatically. `summary.json` records
+total wall time; `shared_costs.json` records validation time and each
+trajectory's `wall_seconds_including_grid`. A rough production estimate is
+the one-time validation cost plus 100 times the benchmark's mean trajectory
+time, with figure generation and reporting overhead added separately.
+Trajectory difficulty and cache reuse can change this estimate. Eight-start
+arm costs already contain the first four starts and boundary searches:
+**do not add four-start and eight-start totals** or count shared grid costs
+once per configuration.
+
 ## Tests
 
 ```bash
@@ -429,6 +562,10 @@ The suite covers:
   full-grid baseline equivalence, isolation from unobserved target cells,
   masked Jacobians, shared computation, paired metrics/failures, and a tiny
   all-five-configuration end-to-end fixture.
+- **Spatial-and-temporal sweep:** nested saved-time selections, the 20-time
+  baseline, isolation from unobserved cells and times, selected Jacobian
+  scaling, three evaluation scopes, paired references along both axes,
+  shared caches, early validation, and a tiny all-15-configuration fixture.
 
 The pilot refinement test is marked `slow`; deselect it with `-m "not slow"`.
 

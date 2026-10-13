@@ -44,7 +44,7 @@ class FieldObjective:
 
     def __init__(self, model, encoder: FieldEncoder, obs: FullFieldObservations,
                  device: torch.device, batch_size: int, sensor_indices=None,
-                 prediction_cache=None, prediction_stats=None):
+                 prediction_cache=None, prediction_stats=None, *, time_indices=None):
         self.model = model.eval()
         self.model.requires_grad_(False)
         self.encoder, self.obs = encoder, obs
@@ -62,9 +62,19 @@ class FieldObjective:
                 or len(np.unique(indices)) != len(indices)):
             raise ValueError("Sensor indices must be distinct integer learning-grid cell indices.")
         self.sensor_indices = indices.astype(np.int64)
+        indices = np.arange(len(obs.times)) if time_indices is None else np.asarray(time_indices)
+        if (indices.ndim != 1 or not len(indices) or indices.dtype.kind not in "iu"
+                or np.any(indices < 0) or np.any(indices >= len(obs.times))
+                or np.any(indices[1:] <= indices[:-1])):
+            raise ValueError("Time indices must be distinct, increasing integer positive-time indices.")
+        self.time_indices = indices.astype(np.int64)
+
+    @property
+    def observed_times(self) -> np.ndarray:
+        return self.obs.times[self.time_indices]
 
     def observe(self, fields: np.ndarray) -> np.ndarray:
-        return np.take(fields, self.sensor_indices, axis=-2)
+        return np.take(np.take(fields, self.time_indices, axis=-3), self.sensor_indices, axis=-2)
 
     def physical_parameters(self, z: np.ndarray) -> np.ndarray:
         return self.low + np.asarray(z) * self.ranges
@@ -129,7 +139,7 @@ class FieldObjective:
 
     def jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         physical, scaled = self.full_jacobians(z)
-        return select_jacobians(physical, scaled, self.sensor_indices)
+        return select_jacobians(physical, scaled, self.sensor_indices, self.time_indices)
 
     def full_jacobians(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Physical J[..., output_channel, parameter] and dimensionless flattened Js."""
@@ -153,9 +163,11 @@ class FieldObjective:
         return physical, scaled
 
 
-def select_jacobians(physical: np.ndarray, scaled: np.ndarray, indices: np.ndarray):
-    selected = np.take(physical, indices, axis=1)
-    selected_scaled = np.take(scaled.reshape(physical.shape), indices, axis=1).reshape(-1, 2)
+def select_jacobians(physical: np.ndarray, scaled: np.ndarray, indices: np.ndarray, time_indices=None):
+    time_indices = np.arange(len(physical)) if time_indices is None else time_indices
+    selected = np.take(np.take(physical, time_indices, axis=0), indices, axis=1)
+    selected_scaled = np.take(np.take(scaled.reshape(physical.shape), time_indices, axis=0),
+                             indices, axis=1).reshape(-1, 2)
     selected_scaled *= np.sqrt(len(scaled) / len(selected_scaled))
     return selected, selected_scaled
 
@@ -208,8 +220,14 @@ def shared_joint_grids(objective: FieldObjective, layouts: dict, size: int) -> t
     for first in range(0, len(points), batch):
         values = objective.predict_many(points[first:first + batch]).astype(np.float64)
         residual = values - objective.obs.targets
-        for name, indices in layouts.items():
-            selected = np.take(residual, indices, axis=2)
+        for name, layout in layouts.items():
+            # Older spatial sweeps supply bare sensor arrays; time sweeps supply both masks.
+            if isinstance(layout, dict):
+                indices = layout["indices"]
+                times = layout.get("time_indices", np.arange(len(objective.times)))
+            else:
+                indices, times = layout, np.arange(len(objective.times))
+            selected = np.take(np.take(residual, times, axis=1), indices, axis=2)
             losses[name][first:first + len(values)] = .5 * np.mean(selected ** 2, axis=(1, 2, 3))
     grids = {}
     for name, values in losses.items():

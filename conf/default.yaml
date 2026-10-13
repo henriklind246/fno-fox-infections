@@ -80,6 +80,7 @@ seeds:
 inverse:
   pilot_cases: 10
   sweep_cases: 100                # paired spatial-sensor sweep; requires >=100 test cases
+  sweep_time_counts: [20, 15, 10, 7, 5]  # nested positive times for sensor/time sweep
   selection_seed: 0
   start_seed: 0
   grid_size: 25

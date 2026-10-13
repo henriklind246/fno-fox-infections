@@ -105,3 +105,14 @@ times. Grid/validation predictions and identical diagnostic parameter pairs
 are shared across configurations. Sensor and complete-grid metrics are
 reported separately, with paired changes relative to the complete-grid
 baseline. The default sweep requires 100 unique held-out test trajectories.
+
+## Paired spatial-and-temporal sweep
+
+`src/fno_fox/inverse_sensor_time_sweep.py` adds the project-local 16/8/4-sensor
+and 20/15/10/7/5-time protocol, using nested saved-time subsets and the same
+test-cohort selection. It shares the existing sweep runner, recovery, JVP
+sensitivities, full-grid replay, and artifact-driven plotting. No additional
+reference code was copied. Selected observations enter fitting, while
+complete fields at selected and unselected times remain explicitly labeled
+evaluation ground truth. Paired references hold either spatial or temporal
+selection fixed. Diagnostics remain deterministic and noiseless.
